@@ -891,6 +891,10 @@ Return ONLY the message text, no labels or formatting."""
 
         # Find Connect button with multiple selectors
         connect_button_selectors = [
+            ("xpath", "//span[normalize-space()='Connect']"),
+            ("xpath", "//*[contains(@class, 'artdeco-button') and .//span[normalize-space()='Connect']]"),
+            ("xpath", "//span[normalize-space()=\'Connect\']"),
+            ("xpath", "//*[contains(@class, \'artdeco-button\') and .//span[normalize-space()=\'Connect\']]"),
             ("css", "button.artdeco-button.artdeco-button--2.artdeco-button--primary[aria-label*='Connect']"),
             ("xpath", "//button[contains(@aria-label, 'Connect') and contains(@class, 'artdeco-button--primary')]"),
             ("xpath", "//button[.//span[text()='Connect']]"),
@@ -966,6 +970,10 @@ Return ONLY the message text, no labels or formatting."""
         
         # Find Connect button
         connect_button_selectors = [
+            ("xpath", "//span[normalize-space()='Connect']"),
+            ("xpath", "//*[contains(@class, 'artdeco-button') and .//span[normalize-space()='Connect']]"),
+            ("xpath", "//span[normalize-space()=\'Connect\']"),
+            ("xpath", "//*[contains(@class, \'artdeco-button\') and .//span[normalize-space()=\'Connect\']]"),
             ("css", "button.artdeco-button.artdeco-button--2.artdeco-button--primary[aria-label*='Connect']"),
             ("xpath", "//button[contains(@aria-label, 'Connect') and contains(@class, 'artdeco-button--primary')]"),
             ("xpath", "//button[.//span[text()='Connect']]"),
@@ -1037,6 +1045,10 @@ Return ONLY the message text, no labels or formatting."""
         
         # Find Connect button with multiple selectors
         connect_button_selectors = [
+            ("xpath", "//span[normalize-space()='Connect']"),
+            ("xpath", "//*[contains(@class, 'artdeco-button') and .//span[normalize-space()='Connect']]"),
+            ("xpath", "//span[normalize-space()=\'Connect\']"),
+            ("xpath", "//*[contains(@class, \'artdeco-button\') and .//span[normalize-space()=\'Connect\']]"),
             ("css", "button.artdeco-button.artdeco-button--2.artdeco-button--primary[aria-label*='Connect']"),
             ("xpath", "//button[contains(@aria-label, 'Connect') and contains(@class, 'artdeco-button--primary')]"),
             ("xpath", "//button[.//span[text()='Connect']]"),
@@ -1160,6 +1172,9 @@ Return ONLY the message text, no labels or formatting."""
 
         # Multiple selector strategies for the Message button
         message_button_selectors = [
+            ("xpath", "//a[contains(@href, \'messaging/compose\')]"),
+            ("xpath", "//a[.//span[normalize-space()=\'Message\']]"),
+            ("xpath", "//span[normalize-space()=\'Message\']"),
             ("css", "button[aria-label*='Message'][class*='artdeco-button']"),
             ("css", "button.artdeco-button--primary[aria-label*='Message']"),
             ("xpath", "//button[contains(@aria-label, 'Message') and contains(@class, 'artdeco-button')]"),
@@ -1308,6 +1323,12 @@ Return ONLY the message text, no labels or formatting."""
         # Multiple selector strategies for the Message button
         message_button_selectors = [
             # Primary selectors (most reliable)
+            ("xpath", "//a[contains(@href, 'messaging/compose')]"),
+            ("xpath", "//a[.//span[normalize-space()='Message']]"),
+            ("xpath", "//span[normalize-space()='Message']"),
+            ("xpath", "//a[contains(@href, \'messaging/compose\')]"),
+            ("xpath", "//a[.//span[normalize-space()=\'Message\']]"),
+            ("xpath", "//span[normalize-space()=\'Message\']"),
             ("css", "button[aria-label*='Message'][class*='artdeco-button']"),
             ("css", "button.artdeco-button--primary[aria-label*='Message']"),
             ("xpath", "//button[contains(@aria-label, 'Message') and contains(@class, 'artdeco-button')]"),
@@ -1998,21 +2019,36 @@ Response:"""
     def find_connect_buttons_enhanced(self):
         """Enhanced button detection with multiple strategies"""
         selectors = [
-            "//button[contains(text(), 'Connect') and not(contains(@class, 'artdeco-button--disabled'))]",
-            "//button[.//span[text()='Connect'] and not(contains(@class, 'disabled'))]",
-            "//button[contains(@aria-label, 'Connect') and not(@disabled)]"
+            "//button[normalize-space()='Connect' or .//span[text()='Connect']]",
+            "//div[@role='button' and (normalize-space()='Connect' or .//span[text()='Connect'])]",
+            "//span[text()='Connect']",
+            "//button[contains(@aria-label, 'Connect')]"
         ]
         
         buttons = []
         for selector in selectors:
             try:
                 found_buttons = self.driver.find_elements(By.XPATH, selector)
-                # Filter out already processed buttons
                 for btn in found_buttons:
-                    if btn.is_displayed() and btn.is_enabled():
-                        buttons.append(btn)
+                    if btn.is_displayed():
+                        parent_text = ""
+                        try:
+                            parent = btn.find_element(By.XPATH, "./ancestor::li | ./ancestor::div[contains(@class, 'entity-result')]")
+                            parent_text = parent.text
+                        except:
+                            try:
+                                parent = btn.find_element(By.XPATH, "./../../..")
+                                parent_text = parent.text
+                            except:
+                                pass
+                                
+                        if "Pending" not in parent_text and "Following" not in parent_text:
+                            buttons.append(btn)
             except Exception as e:
                 logger.debug(f"Selector failed: {selector}, Error: {e}")
+            
+            if buttons:
+                break
         
         # Remove duplicates
         unique_buttons = list(dict.fromkeys(buttons))

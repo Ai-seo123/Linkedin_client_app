@@ -19,7 +19,7 @@ def create_config_gui(self):
     root.resizable(False, False)
         
         # Center the window
-    root.geometry('600x600') # Increased height slightly to fit new fields
+    root.geometry('600x500')
 
     frm = ttk.Frame(root, padding=12)
     frm.pack(fill='both', expand=True)
@@ -29,28 +29,18 @@ def create_config_gui(self):
             font=('Helvetica', 16, 'bold')).grid(row=row, column=0, columnspan=2, pady=(0,10))
     row += 1
 
-        # LinkedIn credentials
-    ttk.Label(frm, text='LinkedIn Credentials:', 
-                 font=('Helvetica', 12, 'bold')).grid(row=row, column=0, columnspan=2, sticky='w')
-    row += 1
-    ttk.Label(frm, text='Email:').grid(row=row, column=0, sticky='e', padx=(0,5))
-    linkedin_email = tk.StringVar()
-    ttk.Entry(frm, textvariable=linkedin_email, width=40).grid(row=row, column=1, sticky='w')
-    row += 1
-    ttk.Label(frm, text='Password:').grid(row=row, column=0, sticky='e', padx=(0,5))
-    linkedin_password = tk.StringVar()
-    ttk.Entry(frm, textvariable=linkedin_password, show='*', width=40).grid(row=row, column=1, sticky='w')
-    row += 1
-
-    # AI Config
     ttk.Label(frm, text='').grid(row=row, column=0)
     row += 1
-    ttk.Label(frm, text='AI Configuration:', 
+    ttk.Label(frm, text='Dashboard Authentication:', 
             font=('Helvetica', 12, 'bold')).grid(row=row, column=0, columnspan=2, sticky='w')
     row += 1
-    ttk.Label(frm, text='Gemini API Key:').grid(row=row, column=0, sticky='e', padx=(0,5))
-    gemini_api_key = tk.StringVar()
-    ttk.Entry(frm, textvariable=gemini_api_key, width=40).grid(row=row, column=1, sticky='w')
+    ttk.Label(frm, text='Dashboard Email:').grid(row=row, column=0, sticky='e', padx=(0,5))
+    dashboard_email = tk.StringVar()
+    ttk.Entry(frm, textvariable=dashboard_email, width=40).grid(row=row, column=1, sticky='w')
+    row += 1
+    ttk.Label(frm, text='Dashboard Password:').grid(row=row, column=0, sticky='e', padx=(0,5))
+    dashboard_password = tk.StringVar()
+    ttk.Entry(frm, textvariable=dashboard_password, show='*', width=40).grid(row=row, column=1, sticky='w')
     row += 1
 
     # ---------------------------------------------------------
@@ -137,9 +127,8 @@ def create_config_gui(self):
             global _tk_config_result
             # Validation
             req = {
-                'linkedin_email': linkedin_email.get().strip(), 
-                'linkedin_password': linkedin_password.get().strip(), 
-                'gemini_api_key': gemini_api_key.get().strip()
+                'dashboard_email': dashboard_email.get().strip(),
+                'dashboard_password': dashboard_password.get().strip()
             }
             missing = [k for k,v in req.items() if not v]
             if missing:
@@ -166,9 +155,8 @@ def create_config_gui(self):
                 return
 
             cfg = {
-                'linkedin_email': req['linkedin_email'],
-                'linkedin_password': req['linkedin_password'],
-                'gemini_api_key': req['gemini_api_key'],
+                'dashboard_email': req['dashboard_email'],
+                'dashboard_password': req['dashboard_password'],
                 # NEW: Save HubSpot Key to config
                 'hubspot_api_key': hubspot_api_key.get().strip(),
                 'local_port': lp,
@@ -270,6 +258,39 @@ def show_status_gui(self):
         except:
             pass
 
+    def stop_all_tasks():
+        count = 0
+        if getattr(self, 'active_campaigns', None):
+            for cid in list(self.active_campaigns.keys()):
+                self.active_campaigns[cid]['stop_requested'] = True
+                count += 1
+                
+        if getattr(self, 'active_searches', None):
+            for sid in list(self.active_searches.keys()):
+                self.active_searches[sid]['stop_requested'] = True
+                count += 1
+                
+        if getattr(self, 'active_collections', None):
+            for cid in list(self.active_collections.keys()):
+                self.active_collections[cid]['stop_requested'] = True
+                count += 1
+                
+        if getattr(self, 'active_sales_nav_fetches', None):
+            for fid in list(self.active_sales_nav_fetches.keys()):
+                self.active_sales_nav_fetches[fid]['stop_requested'] = True
+                count += 1
+                
+        if getattr(self, 'enhanced_inbox', None) and getattr(self.enhanced_inbox, 'active_inbox_sessions', None):
+            for sess_id in list(self.enhanced_inbox.active_inbox_sessions.keys()):
+                self.enhanced_inbox.stop_inbox_session(sess_id)
+                count += 1
+                
+        if count > 0:
+            messagebox.showinfo('Tasks Stopped', f'Sent stop request to {count} active task(s).')
+        else:
+            messagebox.showinfo('Tasks Stopped', 'No active tasks found to stop.')
+
+
     def do_refresh():
         # Update campaigns
         campaigns_lines = []
@@ -331,7 +352,8 @@ def show_status_gui(self):
         root.after(3000, periodic_update)
 
     ttk.Button(btn_frame, text='Refresh', command=do_refresh).grid(row=0, column=0, padx=6)
-    ttk.Button(btn_frame, text='Stop Client', command=stop_client).grid(row=0, column=1, padx=6)
+    ttk.Button(btn_frame, text='Stop All Tasks', command=stop_all_tasks).grid(row=0, column=1, padx=6)
+    ttk.Button(btn_frame, text='Stop Client', command=stop_client).grid(row=0, column=2, padx=6)
 
         # Start periodic updates and enter mainloop
     root.after(100, periodic_update)

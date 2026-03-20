@@ -232,10 +232,14 @@ class EnhancedAIInbox:
                 # Check for Sales Nav access issues
                 if platform == InboxPlatform.SALES_NAVIGATOR and attempt == 1:
                     try:
+                        if "premium/switcher" in driver.current_url:
+                            logger.error("❌ Sales Navigator subscription required (redirected)")
+                            return "SALES_NAV_REQUIRED"
+                            
                         page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
                         if any(keyword in page_text for keyword in ["upgrade", "sales navigator required", "premium"]):
                             logger.error("❌ Sales Navigator subscription required but not available")
-                            return False
+                            return "SALES_NAV_REQUIRED"
                     except:
                         pass
                 
@@ -324,6 +328,28 @@ class EnhancedAIInbox:
         }
     
 
+
+    def _call_proxy_generate(self, prompt: str) -> str:
+        if not self.client:
+            raise Exception("Client instance missing, cannot call AI proxy")
+        
+        url = f"{self.client.config.get('dashboard_url', '').rstrip('/')}/api/client/ai/generate"
+        headers = self.client._get_auth_headers()
+        payload = {'prompt': prompt}
+        
+        import requests
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('success'):
+                return data.get('message', '')
+            raise Exception(data.get('error', 'Unknown proxy error'))
+        elif resp.status_code == 429:
+            raise Exception("QUOTA_EXCEEDED")
+        else:
+            raise Exception(f"Proxy error {resp.status_code}: {resp.text}")
+
     def classify_message_with_ai(self, message: str) -> Optional[MessageIntent]:
         """Use AI to classify message intent with improved priority logic"""
         # Define the prompt with strict hierarchy rules
@@ -353,8 +379,7 @@ PRIORITY RULES:
 Reply with only the category name."""
 
         try:
-            response = self.model.generate_content(prompt)
-            intent_str = response.text.strip().lower()
+            intent_str = self._call_proxy_generate(prompt).strip().lower()
             
             # Map the string response to your Enum
             for intent in MessageIntent:
@@ -372,7 +397,7 @@ Reply with only the category name."""
 
         # 1. PRIMARY: AI-based classification
         # We try this first because it understands context (e.g., "Send invite to naveen@...")
-        if self.model:
+        if True:
             try:
                 ai_intent = self.classify_message_with_ai(message)
                 if ai_intent:
@@ -595,7 +620,7 @@ Reply with only the category name."""
         strategy = self.response_strategies.get(stage, {}).get(intent, "general_response")
         
         # Use AI for personalized response
-        if self.model:
+        if True:
             try:
                 return self.generate_ai_response(contact, conversation_history, metrics, strategy)
             except Exception as e:
@@ -658,8 +683,7 @@ GUIDELINES:
 Generate a response:"""
 
         try:
-            response = self.model.generate_content(prompt)
-            ai_message = response.text.strip()
+            ai_message = self._call_proxy_generate(prompt).strip()
             
             # Clean up response
             ai_message = re.sub(r'^(Response:|Reply:)\s*', '', ai_message, flags=re.IGNORECASE)
@@ -1022,8 +1046,11 @@ Generate a response:"""
                     stored_msg_text = stored_data.get('latest_message_text', '')
                     
                     # === CASE A: NEW MESSAGE DETECTED ===
-                    if current_msg_text != stored_msg_text:
-                        logger.info(f"📬 New message detected from: {current_sender}")
+                    if current_msg_text != stored_msg_text or stored_data.get('pending_reply', False):
+                        if current_msg_text != stored_msg_text:
+                            logger.info(f"📬 New message detected from: {current_sender}")
+                        else:
+                            logger.info(f"⏳ Resuming pending conversation from: {current_sender}")
                         
                         # Update DB immediately
                         inbox_db[conv_id] = {
@@ -1032,7 +1059,8 @@ Generate a response:"""
                             'last_sender': current_sender,
                             'follow_up_count': 0,  # Reset on new activity
                             'status': 'active',
-                            'contact_name': contact.name
+                            'contact_name': contact.name,
+                            'pending_reply': True
                         }
                         self.save_json_db(db_file, inbox_db)
 
@@ -1065,6 +1093,7 @@ Generate a response:"""
                                 inbox_db[conv_id]['latest_message_text'] = reply
                                 inbox_db[conv_id]['last_sender'] = 'You'
                                 inbox_db[conv_id]['last_message_date'] = datetime.now().isoformat()
+                                inbox_db[conv_id]['pending_reply'] = False
                                 self.save_json_db(db_file, inbox_db)
                                 processed_count += 1
                                 actions_taken = True
@@ -1083,9 +1112,18 @@ Generate a response:"""
                                 inbox_db[conv_id]['latest_message_text'] = final_message
                                 inbox_db[conv_id]['last_sender'] = 'You'
                                 inbox_db[conv_id]['last_message_date'] = datetime.now().isoformat()
+                                inbox_db[conv_id]['pending_reply'] = False
                                 self.save_json_db(db_file, inbox_db)
                                 processed_count += 1
                                 actions_taken = True
+                            else:
+                                # User skipped or process stopped
+                                # If it was explicitly skipped by the user, we should stop prompting
+                                user_action = self.active_inbox_sessions.get(session_id, {}).get('user_action')
+                                if user_action and user_action.get('action') in ['skip', 'blacklist']:
+                                    inbox_db[conv_id]['pending_reply'] = False
+                                    self.save_json_db(db_file, inbox_db)
+                                    logger.info(f"Marked {contact.name} as skipped/blacklisted, will not prompt again.")
 
                     # === CASE B: NO NEW MESSAGE → CHECK FOLLOW-UP ===
                     else:
@@ -1120,6 +1158,7 @@ Generate a response:"""
                                         inbox_db[conv_id]['latest_message_text'] = final_message
                                         inbox_db[conv_id]['last_message_date'] = datetime.now().isoformat()
                                         inbox_db[conv_id]['follow_up_count'] = current_fu_count + 1
+                                        inbox_db[conv_id]['pending_reply'] = False
                                         self.save_json_db(db_file, inbox_db)
                                         processed_count += 1
                                         actions_taken = True
@@ -1163,20 +1202,23 @@ Generate a response:"""
             for msg in conversation_history:
                 formatted_history.append({
                     'sender': msg.get('sender','Unknown'),
-                    'text': msg.get('message',''),
+                    'message': msg.get('message',''),
                     'timestamp': msg.get('timestamp','')
                 })
         
         self.active_inbox_sessions[session_id]['awaiting_confirmation'] = True
         self.active_inbox_sessions[session_id]['current_conversation'] = {
-            'contact_name': contact.name,
-            'contact_company': contact.company,
-            'contact_title': contact.title,
+            'contact': {
+                'name': contact.name,
+                'company': contact.company,
+                'title': contact.title,
+                'linkedin_url': contact.linkedin_url,
+            },
+            'conversation_history': formatted_history,
+            'generated_message': suggested_reply,
             'their_message': their_message,
-            'suggested_reply': suggested_reply,
             'intent': intent,
-            'linkedin_url': contact.linkedin_url,
-            'session_id': session_id # Ensure ID is passed for the UI
+            'session_id': session_id  # Ensure ID is passed for the UI
         }
         
         # 2. Report to dashboard so it appears in the UI

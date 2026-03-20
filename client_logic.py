@@ -4,6 +4,12 @@ import threading
 import csv
 from datetime import datetime, date
 from flask import Flask, request, jsonify
+import json
+import time
+import threading
+import csv
+from datetime import datetime, date
+from flask import Flask, request, jsonify
 import requests
 from linkedin_automation import LinkedInAutomation
 import logging
@@ -14,14 +20,14 @@ from tkinter import ttk, messagebox, scrolledtext
 import signal
 import atexit
 import random
-import google.generativeai as genai
 import re
+import hashlib
 from typing import List, Dict, Any
 from enum import Enum
 from dataclasses import dataclass, asdict
 from typing import Optional
 # Import all functions from LinkedIn_automation_script.py
-from urllib.parse import quote_plus
+from urllib.parse import urlencode, quote
 import tempfile
 import platform
 import shutil
@@ -41,10 +47,92 @@ from linkedin_automation import LinkedInAutomation
 
 logger = logging.getLogger(__name__)
 
+LINKEDIN_NETWORK_CODE_BY_DEGREE = {
+    "1st": "F",
+    "2nd": "S",
+    "3rd+": "O",
+    "3rd": "O",
+}
+
+LINKEDIN_GEO_URN_BY_LOCATION = {
+    "australia": "101452733",
+    "belgium": "100565514",
+    "california": "102095887",
+    "california united states": "102095887",
+    "california usa": "102095887",
+    "brazil": "106057199",
+    "canada": "101174742",
+    "china": "102890883",
+    "england": "102299470",
+    "france": "105015875",
+    "germany": "101282230",
+    "india": "102713980",
+    "italy": "103350119",
+    "japan": "101355337",
+    "mexico": "103323778",
+    "netherlands": "102890719",
+    "new york": "103644278",
+    "new york city": "103644278",
+    "nyc": "103644278",
+    "maharashtra": "106300413",
+    "maharashtra india": "106300413",
+    "maharashtra ind": "106300413",
+    "karnataka": "100811329",
+    "karnataka india": "100811329",
+    "greater bengaluru area": "90009633",
+    "greater bangalore area": "90009633",
+    "bengaluru": "105214831",
+    "bangalore": "105214831",
+    "bengaluru karnataka india": "105214831",
+    "bangalore karnataka india": "105214831",
+    "miami": "102394087",
+    "miami florida": "102394087",
+    "miami fl": "102394087",
+    "miami florida united states": "102394087",
+    "miami fl usa": "102394087",
+    "russia": "101728296",
+    "san francisco": "102277331",
+    "san francisco california": "102277331",
+    "san francisco ca": "102277331",
+    "san francisco california united states": "102277331",
+    "san francisco ca usa": "102277331",
+    "singapore": "102454443",
+    "south korea": "105149562",
+    "spain": "105646813",
+    "sweden": "105117694",
+    "switzerland": "106693272",
+    "uae": "104305776",
+    "united arab emirates": "104305776",
+    "united arab emirates uae": "104305776",
+    "united states": "103644278",
+    "united states of america": "103644278",
+    "usa": "103644278",
+}
+
+LINKEDIN_PROFILE_LANGUAGE_CODE_BY_NAME = {
+    "english": "en",
+    "en": "en",
+    "spanish": "es",
+    "es": "es",
+    "portuguese": "pt",
+    "portugese": "pt",
+    "portugues": "pt",
+    "pt": "pt",
+    "french": "fr",
+    "fr": "fr",
+    "chinese": "zh",
+    "mandarin": "zh",
+    "zh": "zh",
+}
+
 class EnhancedLinkedInAutomationClient:
     def __init__(self):
         self.config_file = "client_config.json"
         self.config = self.load_or_create_config()
+        self.runtime_api_key = None
+        self.current_user_config = {}
+        self.current_linkedin_profile_key = ""
+        self.active_browser_profile_key = None
         self.driver = None
         self.wait = None
         self.temp_profile_dir = None
@@ -70,25 +158,12 @@ class EnhancedLinkedInAutomationClient:
             except Exception as e:
                 logger.error(f"⚠️ Could not save new client ID to config: {e}")
 
-        self.email = self.config.get('linkedin_email')
-        self.password = self.config.get('linkedin_password')
+        self.bootstrap_client_api_key()
+        self.email = (self.current_user_config.get('linkedin_email') or self.config.get('linkedin_email') or '').strip()
+        self.password = (self.current_user_config.get('linkedin_password') or self.config.get('linkedin_password') or '').strip()
         
-        # Initialize Gemini AI first
-        try:
-            gemini_api_key = self.config.get('gemini_api_key')
-            if not gemini_api_key:
-                logger.error("❌ No Gemini API key found in configuration")
-                self.model = None
-            else:
-                genai.configure(api_key=gemini_api_key)
-                self.model = genai.GenerativeModel('gemini-2.5-flash-lite')
-                logger.info("✅ Gemini AI initialized successfully")
-        except Exception as e:
-            logger.error(f"❌ Gemini AI initialization failed: {e}")
-            self.model = None
-
-        # Now, initialize EnhancedAIInbox with the created model
-        self.enhanced_inbox = EnhancedAIInbox(gemini_model=self.model, client_instance=self)
+        # Initialize EnhancedAIInbox
+        self.enhanced_inbox = EnhancedAIInbox(client_instance=self)
         
         self.automation_instances = {}
         self.active_campaigns = defaultdict(lambda: {
@@ -109,6 +184,10 @@ class EnhancedLinkedInAutomationClient:
             "end_time": None,
             "driver_errors": 0
         })
+        self.active_sales_nav_fetches = defaultdict(lambda: {
+            "status": "idle",
+            "stop_requested": False
+        })
 
         poll_interval=int(self.config.get('poll_interval_seconds',15))
         try:
@@ -120,7 +199,7 @@ class EnhancedLinkedInAutomationClient:
         """Load existing config or create new one via GUI"""
         if os.path.exists(self.config_file):
             try:
-                with open(self.config_file, 'r') as f:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                 logger.info("✅ Configuration loaded successfully")
                 return config
@@ -130,9 +209,51 @@ class EnhancedLinkedInAutomationClient:
         logger.info("📋 No configuration found, launching setup GUI...")
         return create_config_gui(self)
 
+    def bootstrap_client_api_key(self):
+        """Authenticate with dashboard credentials and fetch the runtime client API key."""
+        dashboard_url = (self.config.get('dashboard_url') or '').strip()
+        dashboard_email = (self.config.get('dashboard_email') or '').strip().lower()
+        dashboard_password = (self.config.get('dashboard_password') or '').strip()
+        client_id = (self.config.get('client_id') or '').strip()
+
+        if not dashboard_url or not dashboard_email or not dashboard_password:
+            logger.warning("Dashboard credentials are incomplete; bootstrap authentication was skipped.")
+            self.runtime_api_key = None
+            return
+
+        endpoint = f"{dashboard_url.rstrip('/')}/api/client/bootstrap-auth"
+        payload = {
+            "email": dashboard_email,
+            "password": dashboard_password,
+            "client_id": client_id
+        }
+
+        try:
+            resp = requests.post(endpoint, json=payload, timeout=20)
+        except requests.exceptions.RequestException as exc:
+            logger.error(f"❌ Dashboard bootstrap request failed: {exc}")
+            self.runtime_api_key = None
+            return
+
+        if resp.status_code != 200:
+            details = resp.text[:200] if resp.text else f"HTTP {resp.status_code}"
+            logger.error(f"❌ Dashboard bootstrap authentication failed: {details}")
+            self.runtime_api_key = None
+            return
+
+        data = resp.json() if resp.content else {}
+        self.runtime_api_key = (data.get('client_api_key') or '').strip() or None
+        self.current_user_config = data.get('user_config') or {}
+        self.current_linkedin_profile_key = (
+            data.get('linkedin_profile_key')
+            or self.current_user_config.get('linkedin_profile_key')
+            or ''
+        ).strip()
+        logger.info("✅ Dashboard bootstrap authentication successful.")
+
     def _get_auth_headers(self):
         """Return authorization headers for dashboard requests"""
-        api_key = self.config.get('gemini_api_key') or self.config.get('client_api_key')
+        api_key = self.runtime_api_key or ""
         return {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
@@ -228,10 +349,11 @@ class EnhancedLinkedInAutomationClient:
         """Request tasks from the dashboard. Returns list of tasks or empty list."""
         SERVER_BASE = self.config.get('dashboard_url') or "https://your-render-app.onrender.com"
         endpoint = f"{SERVER_BASE.rstrip('/')}/api/get-tasks"
-        api_key = self.config.get('client_api_key') or self.config.get('gemini_api_key')
+        if not self.runtime_api_key:
+            self.bootstrap_client_api_key()
 
-        if not api_key:
-            logger.warning("No client API key configured; skipping poll.")
+        if not self.runtime_api_key:
+            logger.warning("No runtime client API key available after dashboard bootstrap; skipping poll.")
             return []
 
         payload = {
@@ -241,12 +363,6 @@ class EnhancedLinkedInAutomationClient:
                 'app_version': self.config.get('version', 'unknown')
             }
         }
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-
         try:
             resp = requests.post(endpoint, json=payload, headers=self._get_auth_headers(), timeout=20)
             if resp.status_code == 200:
@@ -255,6 +371,10 @@ class EnhancedLinkedInAutomationClient:
                 logger.info(f"📥 Polled {len(tasks)} tasks from server.")
                 return tasks
             elif resp.status_code == 204:
+                return []
+            elif resp.status_code in (401, 403):
+                logger.warning(f"Poll rejected with {resp.status_code}. Clearing runtime API key and retrying bootstrap on the next cycle.")
+                self.runtime_api_key = None
                 return []
             else:
                 logger.warning(f"Poll returned {resp.status_code}: {resp.text[:200]}")
@@ -299,6 +419,11 @@ class EnhancedLinkedInAutomationClient:
                 return
                 
             endpoint = f"{SERVER_BASE.rstrip('/')}/api/client-ping"
+            if not self.runtime_api_key:
+                self.bootstrap_client_api_key()
+            if not self.runtime_api_key:
+                logger.warning("No runtime client API key available after dashboard bootstrap; skipping heartbeat.")
+                return
             
             # ... (all the payload creation logic is fine) ...
             active_inbox_sessions = []
@@ -321,9 +446,11 @@ class EnhancedLinkedInAutomationClient:
                 'active_inbox_sessions': active_inbox_sessions
             }
             
-            headers = self._get_auth_headers()
-            
-            resp = requests.post(endpoint, json=payload, headers=headers, timeout=15)
+            resp = requests.post(endpoint, json=payload, headers=self._get_auth_headers(), timeout=15)
+            if resp.status_code in (401, 403):
+                logger.warning(f"Heartbeat rejected with {resp.status_code}. Clearing runtime API key and retrying bootstrap on the next cycle.")
+                self.runtime_api_key = None
+                return
             
             # --- THIS IS THE FIX ---
             # We no longer need to check for actions here.
@@ -343,18 +470,17 @@ class EnhancedLinkedInAutomationClient:
                 return
                 
             endpoint = f"{SERVER_BASE.rstrip('/')}/api/task-status"
-            api_key = self.config.get('client_api_key') or self.config.get('gemini_api_key')
+            if not self.runtime_api_key:
+                self.bootstrap_client_api_key()
+            if not self.runtime_api_key:
+                logger.warning("No runtime client API key available after dashboard bootstrap; skipping task-start report.")
+                return
             
             payload = {
                 'task_id': task_id,
                 'status': 'started',
                 'task_type': task_type,
                 'timestamp': datetime.now().isoformat()
-            }
-            
-            headers = {
-                "Authorization": f"Bearer {api_key}" if api_key else "",
-                "Content-Type": "application/json"
             }
             
             requests.post(endpoint, json=payload, headers=self._get_auth_headers(), timeout=10)
@@ -375,13 +501,57 @@ class EnhancedLinkedInAutomationClient:
             # This will catch errors if the browser has been closed
             return False
 
+    def _get_browser_profile_identity(self):
+        """Resolve the account identity used to isolate persistent Chrome profiles."""
+        profile_key = (self.current_linkedin_profile_key or "").strip()
+        if profile_key:
+            return f"profile_{profile_key}"
+
+        email = (
+            self.email
+            or self.current_user_config.get('linkedin_email')
+            or self.config.get('linkedin_email')
+            or ""
+        ).strip().lower()
+        if email:
+            return f"email_{email}"
+
+        return "default"
+
+    def _get_persistent_profile_dir(self):
+        """Return a stable Chrome user-data directory for the current LinkedIn account."""
+        app_data_dir = os.path.join(os.path.expanduser("~"), ".linkedin_automation")
+        profiles_root = os.path.join(app_data_dir, "chrome_profiles")
+        os.makedirs(profiles_root, exist_ok=True)
+
+        profile_identity = self._get_browser_profile_identity()
+        safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', profile_identity).strip('._-') or "default"
+        safe_name = safe_name[:48]
+        profile_hash = hashlib.sha1(profile_identity.encode("utf-8")).hexdigest()[:10]
+        profile_dir = os.path.join(profiles_root, f"{safe_name}_{profile_hash}")
+        os.makedirs(profile_dir, exist_ok=True)
+
+        return profile_identity, profile_dir
+
     def get_shared_driver(self):
         """
         Gets the shared browser instance. Creates a new one if it doesn't exist,
-        if the user closed the window, or if the session is invalid.
+        if the user closed the window, or if the session is invalid,
+        or if the user account has changed.
         """
-        if not self.is_browser_alive():
-            logger.info("Browser not found or was closed. Initializing a new shared session...")
+        browser_alive = self.is_browser_alive()
+        target_profile_identity = self._get_browser_profile_identity()
+        account_changed = (
+            browser_alive
+            and self.active_browser_profile_key is not None
+            and target_profile_identity != self.active_browser_profile_key
+        )
+
+        if not browser_alive or account_changed:
+            if account_changed:
+                logger.info("🔄 Account change detected! Re-initializing browser session...")
+            else:
+                logger.info("Browser not found or was closed. Initializing a new shared session...")
             
             # Ensure any old driver is fully closed
             if self.driver:
@@ -396,6 +566,7 @@ class EnhancedLinkedInAutomationClient:
                 # Attempt to log in only when creating a new browser
                 if self.login(): # Use the client's login method
                     self.user_name = self.get_user_profile_name(self.driver)
+                    self.active_browser_profile_key = target_profile_identity
                 else:
                     logger.error("❌ Failed to log in with the new browser instance. Cannot proceed.")
                     self.driver.quit()
@@ -404,8 +575,9 @@ class EnhancedLinkedInAutomationClient:
             else:
                 logger.error("❌ Failed to initialize the browser.")
                 return None
-        
-        logger.info("✅ Re-using existing active browser session.")
+        else:
+            logger.info("✅ Re-using existing active browser session.")
+            
         return self.driver
 
     def handle_task(self, task: dict):
@@ -413,6 +585,15 @@ class EnhancedLinkedInAutomationClient:
         task_id = task.get('id') or str(uuid.uuid4())
         ttype = task.get('type','').strip()
         params = task.get('params', {})
+        user_config = params.get('user_config', {})
+        if 'linkedin_email' in user_config:
+            self.email = (user_config.get('linkedin_email') or '').strip()
+        if 'linkedin_password' in user_config:
+            self.password = (user_config.get('linkedin_password') or '').strip()
+        if 'linkedin_profile_key' in user_config:
+            self.current_linkedin_profile_key = (user_config.get('linkedin_profile_key') or '').strip()
+        elif 'linkedin_email' in user_config:
+            self.current_linkedin_profile_key = ''
         
         logger.info(f"🧩 Starting task {task_id[:8]}... type={ttype}")
         
@@ -521,6 +702,10 @@ class EnhancedLinkedInAutomationClient:
                 elif task_to_stop in self.active_searches:
                     self.active_searches[task_to_stop]['stop_requested'] = True
                     logger.info(f"Set stop_requested flag for search {task_to_stop}")
+
+                elif task_to_stop in self.active_sales_nav_fetches:
+                    self.active_sales_nav_fetches[task_to_stop]['stop_requested'] = True
+                    logger.info(f"Set stop_requested flag for Sales Nav list fetch {task_to_stop}")
                 
                 else:
                     logger.warning(f"Could not find active task {task_to_stop} to stop. It might have already completed.")
@@ -532,7 +717,11 @@ class EnhancedLinkedInAutomationClient:
                 campaign_id = params.get('campaign_id', task_id)
                 user_config = params.get('user_config', {})
                 campaign_data = params.get('campaign_data', {})
-                threading.Thread(target=self.execute_outreach_task, args=(campaign_id, user_config, campaign_data), daemon=True).start()
+                threading.Thread(
+                    target=self.execute_outreach_task,
+                    args=(task_id, campaign_id, user_config, campaign_data),
+                    daemon=True
+                ).start()
                 result['success'] = True
                 result['payload'] = {'message': 'Outreach campaign started', 'campaign_id': campaign_id}
 
@@ -599,7 +788,11 @@ class EnhancedLinkedInAutomationClient:
                 campaign_id = params.get('campaign_id', task_id)
                 user_config = params.get('user_config', {})
                 campaign_params = params.get('campaign_params', {})
-                threading.Thread(target=self.run_sales_nav_outreach_campaign, args=(campaign_id, user_config, campaign_params), daemon=True).start()
+                threading.Thread(
+                    target=self.run_sales_nav_outreach_campaign,
+                    args=(task_id, campaign_id, user_config, campaign_params),
+                    daemon=True
+                ).start()
                 result['success'] = True
                 result['payload'] = {'message': 'Sales Nav campaign started', 'campaign_id': campaign_id}
             
@@ -616,7 +809,7 @@ class EnhancedLinkedInAutomationClient:
         finally:
             result['end_time'] = datetime.now().isoformat()
             # For threaded tasks, we report success immediately, the thread reports final status
-            if ttype not in ["outreach_campaign", "start_campaign", "collect_profiles", "keyword_search", "campaign_action","sync_network_stats"]:
+            if ttype not in ["outreach_campaign", "start_campaign", "collect_profiles", "keyword_search", "campaign_action", "sync_network_stats", "fetch_sales_nav_lists", "sales_nav_outreach_campaign"]:
                 try:
                     self.report_task_result(result)
                 except Exception as report_e:
@@ -664,10 +857,20 @@ class EnhancedLinkedInAutomationClient:
             time.sleep(3)
 
             # Step 2: Wait for the connection count element
-            selector = "span.link-without-visited-state span.t-bold"
-            count_element = WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-            )
+            # Updated to support new LinkedIn markup (e.g. <p class="...">239 connections</p>)
+            def find_connection_element(d):
+                elements = d.find_elements(By.XPATH, "//*[contains(translate(text(), 'CONNECTION', 'connection'), 'connection')]")
+                for el in elements:
+                    try:
+                        txt = el.text.strip().lower()
+                        # Matches exact phrases like "239 connections" or "500+ connections"
+                        if re.search(r'^\d+\+?\s*connections?$', txt):
+                            return el
+                    except:
+                        pass
+                return False
+                
+            count_element = WebDriverWait(driver, 15).until(find_connection_element)
 
             count_text = count_element.text.strip()
             logger.info(f"Found connection count text: '{count_text}'")
@@ -854,7 +1057,6 @@ class EnhancedLinkedInAutomationClient:
     def initialize_browser(self):
         """Initialize Chrome browser with PERSISTENT profile for session persistence"""
         from selenium import webdriver
-        import os
         
         try:
             options = webdriver.ChromeOptions()
@@ -862,19 +1064,14 @@ class EnhancedLinkedInAutomationClient:
             options.add_experimental_option("excludeSwitches", ["enable-automation"])
             options.add_experimental_option('useAutomationExtension', False)
             
-            # Use PERSISTENT profile directory instead of temporary
-            app_data_dir = os.path.join(os.path.expanduser("~"), ".linkedin_automation")
-            os.makedirs(app_data_dir, exist_ok=True)
-            
-            profile_dir = os.path.join(app_data_dir, "chrome_profile")
-            
-            # Create profile directory if it doesn't exist
-            os.makedirs(profile_dir, exist_ok=True)
+            # Use a dedicated persistent profile directory per LinkedIn account.
+            profile_identity, profile_dir = self._get_persistent_profile_dir()
             
             options.add_argument(f"--user-data-dir={profile_dir}")
             
             # Store profile path for reference (don't set temp_profile_dir since it's persistent)
             self.persistent_profile_dir = profile_dir
+            logger.debug(f"Resolved browser profile identity: {profile_identity}")
             
             logger.info(f"🔧 Using persistent Chrome profile: {profile_dir}")
             
@@ -1114,74 +1311,225 @@ class EnhancedLinkedInAutomationClient:
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
-        from selenium.common.exceptions import NoSuchElementException, TimeoutException
+        from selenium.common.exceptions import NoSuchElementException
+
+        def normalize_text(value):
+            return re.sub(r"\s+", " ", value or "").strip()
+
+        def is_probable_name(value):
+            value = normalize_text(value)
+            if not value or len(value) > 80:
+                return False
+
+            lower_value = value.lower()
+            blocked_terms = [
+                "about",
+                "activity",
+                "connect",
+                "contact info",
+                "experience",
+                "followers",
+                "following",
+                "message",
+                "mutual",
+                "open to",
+                "people also viewed",
+                "profile",
+                "see all",
+                "show all",
+                "view profile",
+            ]
+            if any(term in lower_value for term in blocked_terms):
+                return False
+
+            tokens = [token for token in value.split(" ") if token]
+            if not 1 <= len(tokens) <= 5:
+                return False
+
+            return any(any(char.isalpha() for char in token) for token in tokens)
+
+        def is_probable_summary(value, excluded_texts=None):
+            value = normalize_text(value)
+            if not value:
+                return False
+
+            if excluded_texts and value in excluded_texts:
+                return False
+
+            if len(value) < 8 or len(value) > 220:
+                return False
+
+            lower_value = value.lower()
+            blocked_terms = [
+                "about",
+                "activity",
+                "connect",
+                "contact info",
+                "experience",
+                "followers",
+                "following",
+                "message",
+                "mutual",
+                "people also viewed",
+                "see all",
+                "show all",
+            ]
+            return not any(term in lower_value for term in blocked_terms)
+
+        def get_first_matching_text(selectors, predicate):
+            for selector in selectors:
+                try:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                except Exception:
+                    continue
+
+                for element in elements:
+                    text = normalize_text(element.text)
+                    if predicate(text):
+                        return text
+            return ""
+
+        def get_profile_snapshot():
+            script = """
+                const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                };
+                const uniqueTexts = (nodes, limit) => {
+                    const texts = [];
+                    for (const node of nodes) {
+                        if (!isVisible(node)) continue;
+                        const text = normalize(node.innerText || node.textContent || '');
+                        if (!text || texts.includes(text)) continue;
+                        texts.push(text);
+                        if (texts.length >= limit) break;
+                    }
+                    return texts;
+                };
+
+                const headingNodes = [];
+                const headingSelectors = ['main h1', 'main h2', 'section h1', 'section h2', 'h1', 'h2', '[data-anonymize="person-name"]'];
+                for (const selector of headingSelectors) {
+                    for (const node of document.querySelectorAll(selector)) {
+                        headingNodes.push(node);
+                    }
+                }
+
+                const firstVisibleHeading = headingNodes.find(isVisible) || null;
+                const headerContainer = firstVisibleHeading
+                    ? (firstVisibleHeading.closest('section, article, main, div') || firstVisibleHeading.parentElement || document.body)
+                    : document.body;
+
+                let aboutText = '';
+                for (const section of document.querySelectorAll('section, div')) {
+                    if (!isVisible(section)) continue;
+
+                    const labels = Array.from(section.querySelectorAll('h1, h2, h3, span, p'))
+                        .map(node => normalize(node.innerText || node.textContent || ''))
+                        .filter(Boolean);
+
+                    if (!labels.some(label => label.toLowerCase() === 'about')) continue;
+
+                    const detailNodes = Array.from(section.querySelectorAll('p, span, div, li'));
+                    const detailTexts = uniqueTexts(detailNodes, 80).filter(text => text.toLowerCase() !== 'about');
+                    aboutText = detailTexts.sort((a, b) => b.length - a.length)[0] || '';
+                    if (aboutText) break;
+                }
+
+                return {
+                    nameCandidates: uniqueTexts(headingNodes, 20),
+                    headlineCandidates: uniqueTexts(headerContainer.querySelectorAll('p, h3, h4, span, div, li'), 60),
+                    aboutText
+                };
+            """
+            try:
+                return driver.execute_script(script) or {}
+            except Exception as exc:
+                logger.debug(f"Profile snapshot script failed: {exc}")
+                return {}
         
         profile_data = {}
         try:
-            # NEW: Wait for the main profile heading to load
             WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "h1.t-24"))
+                lambda d: d.execute_script("return document.readyState") == "complete"
             )
 
-            # Extract name
-            try:
-                # SELECTOR UPDATED based on your HTML: h1 with class t-24
-                name_elem = driver.find_element(By.CSS_SELECTOR, "h1.t-24.v-align-middle.break-words")
-                profile_data['extracted_name'] = name_elem.text.strip()
+            snapshot = get_profile_snapshot()
+
+            name_candidates = [normalize_text(text) for text in snapshot.get('nameCandidates', []) if normalize_text(text)]
+            headline_candidates = [normalize_text(text) for text in snapshot.get('headlineCandidates', []) if normalize_text(text)]
+            about_text = normalize_text(snapshot.get('aboutText', ''))
+
+            name = next((text for text in name_candidates if is_probable_name(text)), "")
+            if not name:
+                name = get_first_matching_text(
+                    [
+                        "main h1",
+                        "main h2",
+                        "section h1",
+                        "section h2",
+                        "[data-anonymize='person-name']",
+                        "h1",
+                        "h2",
+                    ],
+                    is_probable_name
+                )
+
+            profile_data['extracted_name'] = name or "Professional"
+            if name:
                 logger.info(f"📝 Extracted name: {profile_data['extracted_name']}")
-            except NoSuchElementException:
-                logger.warning("Could not find name element, trying fallback.")
-                try:
-                    # Fallback for slightly different structures
-                    name_elem = driver.find_element(By.CSS_SELECTOR, "h1")
-                    profile_data['extracted_name'] = name_elem.text.strip()
-                    logger.info(f"📝 Extracted name (fallback): {profile_data['extracted_name']}")
-                except Exception as e:
-                    logger.error(f"Failed to extract name: {e}")
-                    profile_data['extracted_name'] = "Professional"
+            else:
+                logger.warning("Could not confidently extract profile name. Using fallback.")
 
+            excluded_texts = {profile_data['extracted_name']}
+            headline = next((text for text in headline_candidates if is_probable_summary(text, excluded_texts)), "")
+            if not headline:
+                headline = get_first_matching_text(
+                    [
+                        "main p",
+                        "main div",
+                        "section p",
+                        "section div",
+                        "div.text-body-medium.break-words",
+                        "p",
+                    ],
+                    lambda text: is_probable_summary(text, excluded_texts)
+                )
 
-            # Extract headline
-            try:
-                # SELECTOR UPDATED based on your HTML: div with class text-body-medium
-                headline_elem = driver.find_element(By.CSS_SELECTOR, "div.text-body-medium.break-words")
-                headline_text = headline_elem.text.strip()
-                if headline_text and headline_text != profile_data.get('extracted_name', ''):
-                    profile_data['extracted_headline'] = headline_text
-                    logger.info(f"💼 Extracted headline: {headline_text[:50]}...")
-            except NoSuchElementException:
-                logger.warning("Could not find headline element.")
-                profile_data['extracted_headline'] = ""
+            profile_data['extracted_headline'] = headline
+            if headline:
+                logger.info(f"💼 Extracted headline: {headline[:50]}...")
 
-
-            # Extract about section (Selector likely needs updating too)
-            try:
-                # This selector is probably also broken and will need to be inspected
+            if not about_text:
                 about_selectors = [
                     "[data-test-id='about-section'] .pv-shared-text-with-see-more span[aria-hidden='true']",
                     ".pv-about-section .pv-shared-text-with-see-more span",
-                    # Add a new selector here if you find one
+                    "section[data-view-name*='about'] span[aria-hidden='true']",
+                    "section[data-view-name*='about'] div[aria-hidden='true']",
                 ]
-                
                 for selector in about_selectors:
                     try:
                         about_elem = driver.find_element(By.CSS_SELECTOR, selector)
-                        about_text = about_elem.text.strip()
+                        about_text = normalize_text(about_elem.text)
                         if about_text:
-                            profile_data['about_snippet'] = about_text[:150] + "..." if len(about_text) > 150 else about_text
-                            logger.info(f"📄 Extracted about: {profile_data['about_snippet'][:50]}...")
                             break
                     except NoSuchElementException:
                         continue
-            except Exception as e:
-                logger.warning(f"Could not extract about section: {e}")
+
+            if about_text:
+                profile_data['about_snippet'] = about_text[:150] + "..." if len(about_text) > 150 else about_text
+                logger.info(f"📄 Extracted about: {profile_data['about_snippet'][:50]}...")
 
             # Set defaults
             if not profile_data.get('about_snippet'):
                 profile_data['about_snippet'] = ""
+            if not profile_data.get('extracted_headline'):
+                profile_data['extracted_headline'] = ""
 
         except Exception as e:
-            # This is the error you were seeing before
             logger.warning(f"⚠️ Profile data extraction failed: {e}")
             profile_data = {
                 'extracted_name': 'Professional',
@@ -1192,20 +1540,20 @@ class EnhancedLinkedInAutomationClient:
         return profile_data
 
     def generate_message(self, name, company, role, service_1, service_2, profile_data=None):
-        """Generate personalized message using AI"""
-        if not self.model:
-            fallback_msg = f"Hi {name}, I'm impressed by your work as {role} at {company}. I'd love to connect and learn more about your experience. Looking forward to connecting!"
-            return fallback_msg[:280]
-
+        """Generate personalized message using AI via backend proxy"""
         actual_name = profile_data.get('extracted_name', name) if profile_data else name
+        extracted_headline = profile_data.get('extracted_headline', '') if profile_data else ''
         about_snippet = profile_data.get('about_snippet', '') if profile_data else ''
 
+        fallback_msg = f"Hi {actual_name}, I'm impressed by your {role} work at {company}. I'd love to connect and exchange insights. Looking forward to connecting!"
+        
         MESSAGE_TEMPLATE = """Create a personalized LinkedIn connection message based on the profile information provided.
 
 Profile Information:
 - Name: {Name}
 - Company: {Company}  
 - Role: {Role}
+- Headline / Company Description: {Headline}
 - Services/Expertise: {service_1}, {service_2}
 - About/Bio: {about_snippet}
 
@@ -1222,34 +1570,50 @@ Return ONLY the message text, no labels or formatting.
             Name=actual_name,
             Company=company,
             Role=role,
+            Headline=extracted_headline,
             service_1=service_1 or "your field",
             service_2=service_2 or "industry trends",
             about_snippet=about_snippet
         )
 
+        dashboard_url = self.config.get('dashboard_url', 'http://127.0.0.1:5000')
+        endpoint = f"{dashboard_url.rstrip('/')}/api/client/ai/generate"
+
         for attempt in range(3):
             try:
-                response = self.model.generate_content(prompt)
-                message = response.text.strip()
-                message = re.sub(r'^(Icebreaker:|Message:)\s*', '', message, flags=re.IGNORECASE)
-                message = message.strip('"\'[]')
+                response = requests.post(
+                    endpoint,
+                    json={'prompt': prompt},
+                    headers=self._get_auth_headers(),
+                    timeout=30
+                )
                 
-                if len(message) > 280:
-                    message = message[:277] + "..."
-                
-                return message
-                
-            except Exception as e:
-                if "429" in str(e) or "ResourceExhausted" in str(e):
-                    wait_time = 30 * (attempt + 1)
-                    logger.warning(f"⏳ Gemini rate limit hit. Retrying in {wait_time} seconds...")
-                    time.sleep(wait_time)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('success'):
+                        message = data.get('message', '').strip()
+                        message = re.sub(r'^(Icebreaker:|Message:)\s*', '', message, flags=re.IGNORECASE)
+                        message = message.strip('"\'[]')
+                        
+                        if len(message) > 280:
+                            message = message[:277] + "..."
+                            
+                        return message
+                    else:
+                        logger.error(f"❌ Backend AI Generation error: {data.get('error')}")
+                        break
+                elif response.status_code == 429:
+                    logger.warning("⏳ Daily AI quota exceeded or rate limit hit. Using fallback message.")
+                    return fallback_msg[:280]
                 else:
-                    logger.error(f"❌ Gemini error: {e}")
+                    logger.error(f"❌ AI proxy returned {response.status_code}: {response.text}")
                     break
+                    
+            except Exception as e:
+                logger.error(f"❌ Error communicating with AI proxy: {e}")
+                time.sleep(2)
 
         # Fallback message
-        fallback_msg = f"Hi {actual_name}, I'm impressed by your {role} work at {company}. I'd love to connect and exchange insights. Looking forward to connecting!"
         return fallback_msg[:280]
 
     def safe_click(self, driver, element):
@@ -1272,6 +1636,109 @@ Return ONLY the message text, no labels or formatting.
         except Exception as e:
             logger.warning(f"Click failed: {e}")
             return False
+
+    def go_to_next_page(self, driver, timeout=10):
+        """Advance LinkedIn search pagination when a visible Next button exists."""
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+
+        selectors = [
+            (By.CSS_SELECTOR, "button[data-testid='pagination-controls-next-button-visible']"),
+            (By.CSS_SELECTOR, "button[aria-label='Next']"),
+            (By.XPATH, "//button[.//span[normalize-space()='Next']]"),
+            (By.XPATH, "//button[normalize-space()='Next']"),
+        ]
+
+        previous_url = (driver.current_url or "").strip()
+        previous_marker = None
+        try:
+            items = driver.find_elements(By.CSS_SELECTOR, "main a[href*='/in/'], main a[href*='/sales/lead/']")
+            for item in items:
+                href = (item.get_attribute("href") or "").strip()
+                if href:
+                    previous_marker = href
+                    break
+        except Exception:
+            previous_marker = None
+
+        next_button = None
+        for by, selector in selectors:
+            try:
+                candidates = driver.find_elements(by, selector)
+            except Exception:
+                continue
+
+            for candidate in candidates:
+                try:
+                    if not candidate.is_displayed():
+                        continue
+                    disabled_attr = (candidate.get_attribute("disabled") or "").strip().lower()
+                    aria_disabled = (candidate.get_attribute("aria-disabled") or "").strip().lower()
+                    classes = (candidate.get_attribute("class") or "").lower()
+                    if disabled_attr in {"true", "disabled"} or aria_disabled == "true" or "disabled" in classes:
+                        logger.info("Next page button is present but disabled.")
+                        return False
+                    next_button = candidate
+                    break
+                except Exception:
+                    continue
+            if next_button:
+                break
+
+        if not next_button:
+            logger.info("Next page button not found on the current results page.")
+            return False
+
+        try:
+            if not self.safe_click(driver, next_button):
+                driver.execute_script("arguments[0].click();", next_button)
+        except Exception as exc:
+            logger.warning(f"Failed to click next page button: {exc}")
+            return False
+
+        def page_advanced(_driver):
+            try:
+                current_url = (_driver.current_url or "").strip()
+                if current_url and current_url != previous_url:
+                    return True
+            except Exception:
+                pass
+
+            if previous_marker:
+                try:
+                    items = _driver.find_elements(By.CSS_SELECTOR, "main a[href*='/in/'], main a[href*='/sales/lead/']")
+                    for item in items:
+                        href = (item.get_attribute("href") or "").strip()
+                        if href and href != previous_marker:
+                            return True
+                except Exception:
+                    pass
+
+            try:
+                loading_spinners = _driver.find_elements(By.CSS_SELECTOR, "[aria-busy='true'], .artdeco-loader, .search-loader")
+                if loading_spinners:
+                    return False
+            except Exception:
+                pass
+
+            return False
+
+        try:
+            WebDriverWait(driver, timeout).until(page_advanced)
+        except Exception:
+            logger.warning("Clicked Next, but could not confirm that the results page advanced.")
+            return False
+
+        try:
+            WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "main"))
+            )
+        except Exception:
+            pass
+
+        self.human_delay(2, 4)
+        return True
 
     
 
@@ -1297,6 +1764,624 @@ Return ONLY the message text, no labels or formatting.
                 continue
         return None
 
+    def _find_active_connect_dialog(self, driver, timeout=8):
+        """Find a visible invite dialog. Used as a helper, not a hard gate."""
+        deadline = time.time() + timeout
+        selectors = [
+            (By.CSS_SELECTOR, "dialog"),
+            (By.CSS_SELECTOR, "#artdeco-modal-outlet [data-test-modal-id='send-invite-modal'][aria-hidden='false']"),
+            (By.CSS_SELECTOR, "#artdeco-modal-outlet [data-test-modal-container][data-test-modal-id='send-invite-modal']"),
+            (By.CSS_SELECTOR, "#artdeco-modal-outlet .artdeco-modal-overlay:not([aria-hidden='true'])"),
+            (By.CSS_SELECTOR, "div[role='dialog'][aria-labelledby]"),
+            (By.CSS_SELECTOR, "div[role='dialog']"),
+            (By.CSS_SELECTOR, "div.artdeco-modal"),
+            (By.CSS_SELECTOR, "#artdeco-modal-outlet div[data-test-modal][role='dialog']"),
+            (By.CSS_SELECTOR, "#artdeco-modal-outlet div[role='dialog']"),
+            (By.CSS_SELECTOR, "div[data-test-modal][role='dialog']"),
+            (By.CSS_SELECTOR, "div.artdeco-modal.send-invite"),
+        ]
+
+        while time.time() < deadline:
+            for by, selector in selectors:
+                try:
+                    dialogs = driver.find_elements(by, selector)
+                except Exception:
+                    continue
+
+                for dialog in reversed(dialogs):
+                    try:
+                        if not dialog.is_displayed():
+                            continue
+                        aria_hidden = (dialog.get_attribute("aria-hidden") or "").strip().lower()
+                        if aria_hidden == "true":
+                            continue
+                        return dialog
+                    except Exception:
+                        continue
+            time.sleep(0.2)
+        return None
+
+    def _wait_for_people_results(self, driver, timeout=12):
+        """Wait for LinkedIn people search results to render before scanning for buttons."""
+        deadline = time.time() + timeout
+        result_selectors = [
+            (By.CSS_SELECTOR, "main li.reusable-search__result-container"),
+            (By.CSS_SELECTOR, "main div.entity-result"),
+            (By.CSS_SELECTOR, "main li[data-chameleon-result-urn]"),
+            (By.CSS_SELECTOR, "main a[href*='/in/']"),
+            (By.CSS_SELECTOR, "main a[href*='/sales/lead/']"),
+        ]
+
+        while time.time() < deadline:
+            for by, selector in result_selectors:
+                try:
+                    matches = driver.find_elements(by, selector)
+                except Exception:
+                    continue
+
+                for match in matches:
+                    try:
+                        if match.is_displayed():
+                            return True
+                    except Exception:
+                        continue
+            time.sleep(0.25)
+        return False
+
+    def _button_or_card_indicates_sent(self, driver, button):
+        """Check whether the clicked result card now reflects a sent invitation."""
+        try:
+            return bool(driver.execute_script("""
+                const btn = arguments[0];
+                if (!btn) return false;
+
+                const textOf = (node) => ((node?.innerText || '') + ' ' + (node?.getAttribute?.('aria-label') || '')).toLowerCase();
+                const selfText = textOf(btn);
+                if (selfText.includes('pending') || selfText.includes('invitation sent')) {
+                    return true;
+                }
+
+                const card = btn.closest(
+                    "li, .reusable-search__result-container, .entity-result, [data-chameleon-result-urn], .search-results-container li"
+                );
+                if (!card) return false;
+
+                const cardText = textOf(card);
+                if (cardText.includes('invitation sent')) {
+                    return true;
+                }
+
+                const pendingButton = Array.from(card.querySelectorAll('button, span, div')).find((node) => {
+                    const text = textOf(node).trim();
+                    return text === 'pending' || text.includes('invitation sent');
+                });
+                return Boolean(pendingButton);
+            """, button))
+        except Exception:
+            return False
+
+    def _has_active_invite_modal(self, driver):
+        """Detect LinkedIn's active send-invite modal using the live outlet DOM."""
+        try:
+            return bool(driver.execute_script("""
+                const outlet = document.querySelector('#artdeco-modal-outlet');
+                if (!outlet) return false;
+
+                const modalRoots = Array.from(
+                    outlet.querySelectorAll(
+                        "[data-test-modal-id='send-invite-modal'], " +
+                        "[data-test-modal-container][data-test-modal-id='send-invite-modal'], " +
+                        ".artdeco-modal-overlay, " +
+                        ".artdeco-modal.send-invite, " +
+                        ".artdeco-modal[role='dialog'], " +
+                        "[data-test-modal][role='dialog'], " +
+                        "[role='dialog']"
+                    )
+                );
+
+                return modalRoots.some((node) => {
+                    if (!node) return false;
+
+                    const ariaHidden = (node.getAttribute('aria-hidden') || '').trim().toLowerCase();
+                    if (ariaHidden === 'true') return false;
+
+                    const visible = Boolean(node.offsetParent || node.getClientRects().length);
+                    const dialog = node.matches('.artdeco-modal, [role="dialog"]')
+                        ? node
+                        : node.querySelector('.artdeco-modal.send-invite, .artdeco-modal[role="dialog"], [data-test-modal][role="dialog"], [role="dialog"]');
+                    const actionbar = (dialog && dialog.querySelector('.artdeco-modal__actionbar'))
+                        || node.querySelector('.artdeco-modal__actionbar');
+                    const sendButton = (actionbar && actionbar.querySelector(
+                        "button[aria-label='Send without a note'], " +
+                        "button[aria-label*='Send without a note'], " +
+                        "button.artdeco-button--primary"
+                    )) || node.querySelector(
+                        "button[aria-label='Send without a note'], " +
+                        "button[aria-label*='Send without a note']"
+                    );
+                    const text = ((node.innerText || '') + ' ' + ((dialog && dialog.innerText) || '')).toLowerCase();
+
+                    return visible && (
+                        Boolean(sendButton) ||
+                        text.includes('send without a note') ||
+                        text.includes('add a note')
+                    );
+                });
+            """))
+        except Exception as exc:
+            logger.debug(f"Invite modal probe failed: {exc}")
+            return False
+
+    def dismiss_active_modal(self, driver, timeout=3):
+        """Dismiss a visible modal so the bot does not click behind it."""
+        dialog = self._find_active_connect_dialog(driver, timeout=timeout)
+        if not dialog:
+            return True
+
+        selectors = [
+            (By.CSS_SELECTOR, "button[aria-label='Dismiss']"),
+            (By.CSS_SELECTOR, "button[aria-label='Close']"),
+            (By.CSS_SELECTOR, "button.artdeco-modal__dismiss"),
+            (By.XPATH, ".//button[@aria-label='Dismiss' or @aria-label='Close']"),
+        ]
+
+        for by, selector in selectors:
+            try:
+                buttons = dialog.find_elements(by, selector)
+            except Exception:
+                continue
+
+            for button in buttons:
+                try:
+                    if not button.is_displayed():
+                        continue
+                    if self.safe_click(driver, button):
+                        time.sleep(0.5)
+                        return self._find_active_connect_dialog(driver, timeout=1) is None
+                    driver.execute_script("arguments[0].click();", button)
+                    time.sleep(0.5)
+                    return self._find_active_connect_dialog(driver, timeout=1) is None
+                except Exception:
+                    continue
+        return False
+
+    def _wait_for_invite_submit_result(self, driver, timeout=4):
+        """Confirm invite submission by pending state or modal closure."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                pending_items = driver.find_elements(
+                    By.XPATH,
+                    "//button[contains(., 'Pending')] | //span[contains(., 'Pending')]"
+                )
+                for item in pending_items:
+                    if item.is_displayed():
+                        return True
+            except Exception:
+                pass
+
+            if self._find_active_connect_dialog(driver, timeout=0.2) is None:
+                return True
+            time.sleep(0.25)
+        return False
+
+    def _log_invite_modal_diagnostics(self, driver, context, selectors):
+        """Capture lightweight diagnostics for failed invite modal actions."""
+        original_handle = None
+        try:
+            original_handle = driver.current_window_handle
+            logger.warning(
+                f"[invite_diag:{context}] current_handle={original_handle} "
+                f"handles={len(driver.window_handles)} url='{driver.current_url}' title='{driver.title}'"
+            )
+        except Exception as exc:
+            logger.warning(f"[invite_diag:{context}] window_state_error={exc}")
+
+        try:
+            dialog_count = len(driver.find_elements(By.CSS_SELECTOR, "#artdeco-modal-outlet div[role='dialog'], div.artdeco-modal"))
+            logger.warning(f"[invite_diag:{context}] dialog_count={dialog_count}")
+        except Exception as exc:
+            logger.warning(f"[invite_diag:{context}] dialog_count_error={exc}")
+
+        try:
+            for handle in driver.window_handles:
+                driver.switch_to.window(handle)
+                handle_dialog_count = len(
+                    driver.find_elements(By.CSS_SELECTOR, "#artdeco-modal-outlet div[role='dialog'], div.artdeco-modal")
+                )
+                logger.warning(
+                    f"[invite_diag:{context}] handle={handle} "
+                    f"url='{driver.current_url}' title='{driver.title}' dialogs={handle_dialog_count}"
+                )
+        except Exception as exc:
+            logger.warning(f"[invite_diag:{context}] handle_scan_error={exc}")
+        finally:
+            if original_handle:
+                try:
+                    driver.switch_to.window(original_handle)
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+
+        for by, selector in selectors:
+            try:
+                matches = driver.find_elements(by, selector)
+            except Exception:
+                continue
+
+            if matches:
+                logger.warning(f"[invite_diag:{context}] selector='{selector}' matches={len(matches)}")
+
+            for index, element in enumerate(matches[:2]):
+                try:
+                    text = re.sub(r"\s+", " ", (element.text or "")).strip()[:80]
+                    aria = (element.get_attribute("aria-label") or "").strip()[:80]
+                    classes = (element.get_attribute("class") or "").strip()[:120]
+                    logger.warning(
+                        f"[invite_diag:{context}] candidate#{index + 1} "
+                        f"displayed={element.is_displayed()} enabled={element.is_enabled()} "
+                        f"aria='{aria}' text='{text}' class='{classes}'"
+                    )
+                except Exception:
+                    continue
+
+        try:
+            modal_html = driver.execute_script("""
+                let dialog = document.querySelector('div[role="dialog"]');
+                if (dialog) return (dialog.outerHTML || '').replace(/\\s+/g, ' ').trim().slice(0, 1200);
+                
+                const outlet = document.querySelector('#artdeco-modal-outlet');
+                if (!outlet) return '';
+                return (outlet.outerHTML || '').replace(/\\s+/g, ' ').trim().slice(0, 1200);
+            """)
+            logger.warning(f"[invite_diag:{context}] modal_html='{modal_html or '<empty>'}'")
+        except Exception as exc:
+            logger.warning(f"[invite_diag:{context}] modal_html_error={exc}")
+
+    def _iter_window_handles(self, driver):
+        """Yield available window handles, keeping current one first."""
+        try:
+            current = driver.current_window_handle
+            handles = list(driver.window_handles)
+        except Exception:
+            return []
+
+        ordered = [current]
+        for handle in handles:
+            if handle != current:
+                ordered.append(handle)
+        return ordered
+
+    def _find_send_button_across_contexts(self, driver, selectors, wait_seconds):
+        """Find a visible send button across tabs/windows and top-level frames."""
+        from selenium.common.exceptions import TimeoutException
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.webdriver.support.ui import WebDriverWait
+
+        for handle in self._iter_window_handles(driver):
+            try:
+                driver.switch_to.window(handle)
+                driver.switch_to.default_content()
+            except Exception:
+                continue
+
+            frame_targets = [None]
+            try:
+                frame_count = len(driver.find_elements(By.TAG_NAME, "iframe"))
+                frame_targets.extend(range(frame_count))
+            except Exception:
+                pass
+
+            for frame_index in frame_targets:
+                try:
+                    driver.switch_to.default_content()
+                    if frame_index is not None:
+                        driver.switch_to.frame(frame_index)
+                except Exception:
+                    continue
+
+                for by, selector in selectors:
+                    candidates = []
+                    try:
+                        clickable = WebDriverWait(driver, wait_seconds).until(
+                            EC.element_to_be_clickable((by, selector))
+                        )
+                        candidates.append(clickable)
+                    except TimeoutException:
+                        pass
+                    except Exception:
+                        pass
+
+                    try:
+                        candidates.extend(driver.find_elements(by, selector))
+                    except Exception:
+                        pass
+
+                    for candidate in candidates:
+                        try:
+                            if candidate.is_displayed() and candidate.is_enabled():
+                                return handle, frame_index, candidate
+                        except Exception:
+                            continue
+        return None, None, None
+
+    def click_send_without_note_button(self, driver, timeout=12, dialog=None, context="invite_flow"):
+        """Click Send without note with reliability-first waiting and verification."""
+        selectors = [
+            (By.XPATH, "//button[contains(., 'Send without a note')]"),
+            (By.XPATH, "//button[contains(@aria-label, 'Send without a note')]"),
+            (By.CSS_SELECTOR, "button[aria-label='Send without a note']"),
+            (By.XPATH, "//button[.//span[contains(normalize-space(), 'Send without a note')]]"),
+            (By.CSS_SELECTOR, "div[role='dialog'] .artdeco-button--primary"),
+            (By.CSS_SELECTOR, "div.artdeco-modal__actionbar button.artdeco-button--primary"),
+            (By.CSS_SELECTOR, "#artdeco-modal-outlet button[aria-label='Send without a note']"),
+            (By.CSS_SELECTOR, "button.connect-cta-form__send"),
+            (By.CSS_SELECTOR, "button[aria-label='Send now']"),
+            (By.XPATH, "//button[contains(@aria-label, 'Send invitation')]"),
+        ]
+
+        deadline = time.time() + timeout
+        settle_deadline = min(deadline, time.time() + 2.5)
+        original_handle = None
+        try:
+            original_handle = driver.current_window_handle
+        except Exception:
+            original_handle = None
+
+        # Phase 1: short settle wait so LinkedIn can render modal actionbar.
+        while time.time() < settle_deadline:
+            if self._find_active_connect_dialog(driver, timeout=0.2):
+                break
+            for by, selector in selectors[:3]:
+                try:
+                    if any(btn.is_displayed() for btn in driver.find_elements(by, selector)):
+                        settle_deadline = time.time()
+                        break
+                except Exception:
+                    continue
+            time.sleep(0.2)
+
+        # Phase 2: explicit clickable wait + layered click fallbacks.
+        while time.time() < deadline:
+            wait_seconds = max(0.2, min(1.2, deadline - time.time()))
+            active_handle, frame_index, candidate = self._find_send_button_across_contexts(
+                driver,
+                selectors,
+                wait_seconds
+            )
+
+            if not candidate:
+                time.sleep(0.25)
+                continue
+
+            try:
+                driver.switch_to.window(active_handle)
+                driver.switch_to.default_content()
+                if frame_index is not None:
+                    driver.switch_to.frame(frame_index)
+            except Exception:
+                pass
+
+            try:
+                if not candidate.is_displayed() or not candidate.is_enabled():
+                    time.sleep(0.15)
+                    continue
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", candidate)
+                time.sleep(0.15)
+
+                clicked = False
+                try:
+                    candidate.click()
+                    clicked = True
+                    logger.info("Clicked Send Without Note natively.")
+                except Exception:
+                    pass
+
+                if not clicked:
+                    clicked = self.safe_click(driver, candidate)
+                    if clicked:
+                        logger.info("Clicked Send Without Note via safe_click.")
+
+                if not clicked:
+                    try:
+                        driver.execute_script("arguments[0].click();", candidate)
+                        clicked = True
+                        logger.info("Clicked Send Without Note via JS.")
+                    except Exception:
+                        clicked = False
+
+                if clicked and self._wait_for_invite_submit_result(driver, timeout=4):
+                    if original_handle:
+                        try:
+                            driver.switch_to.window(original_handle)
+                            driver.switch_to.default_content()
+                        except Exception:
+                            pass
+                    return True
+            except Exception:
+                pass
+
+            time.sleep(0.2)
+
+        logger.warning(f"Could not find or click Send Without Note button after {timeout}s.")
+        if original_handle:
+            try:
+                driver.switch_to.window(original_handle)
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+        self._log_invite_modal_diagnostics(driver, context, selectors)
+        return False
+
+    def _normalize_linkedin_url(self, url):
+        if not url:
+            return ""
+        if url.startswith("/"):
+            return f"https://www.linkedin.com{url}"
+        return url
+
+    def _extract_sales_nav_list_name(self, element):
+        """Extract a human-readable Sales Nav saved-search title."""
+        title = (element.text or "").strip()
+
+        if not title or title in {"…", "..."}:
+            title = (element.get_attribute("title") or "").strip()
+
+        if not title:
+            aria_label = (element.get_attribute("aria-label") or "").strip()
+            prefix = "Go to search results for "
+            title = aria_label[len(prefix):].strip() if aria_label.startswith(prefix) else aria_label
+
+        if not title:
+            title = (element.get_attribute("innerText") or "").strip()
+
+        if "\n" in title:
+            title = next((line.strip() for line in title.splitlines() if line.strip()), title)
+
+        return re.sub(r"\s+", " ", title).strip()
+
+    def _scroll_sales_nav_saved_lists_panel(self, driver, anchor=None):
+        """Scroll the saved-searches panel to reveal more list entries."""
+        try:
+            driver.execute_script(
+                """
+                const anchor = arguments[0];
+                if (anchor) {
+                    anchor.scrollIntoView({block: 'end'});
+                    let parent = anchor.parentElement;
+                    while (parent) {
+                        const style = window.getComputedStyle(parent);
+                        const canScroll = ['auto', 'scroll'].includes(style.overflowY) &&
+                            parent.scrollHeight > parent.clientHeight;
+                        if (canScroll) {
+                            parent.scrollTop = parent.scrollHeight;
+                            return true;
+                        }
+                        parent = parent.parentElement;
+                    }
+                }
+                window.scrollBy(0, 500);
+                return false;
+                """,
+                anchor,
+            )
+        except Exception:
+            pass
+
+    def _get_sales_nav_result_candidates(self, driver):
+        """Return visible Sales Navigator row action buttons with extracted lead names."""
+        candidates = []
+        selectors = [
+            "button[aria-label^='See more actions for ']",
+            "button[aria-label*='See more actions for']",
+            "button[data-search-overflow-trigger]",
+        ]
+
+        seen_names = set()
+        for selector in selectors:
+            try:
+                buttons = driver.find_elements(By.CSS_SELECTOR, selector)
+            except Exception:
+                continue
+
+            for button in buttons:
+                try:
+                    if not button.is_displayed() or not button.is_enabled():
+                        continue
+
+                    label = (button.get_attribute("aria-label") or "").strip()
+                    match = re.search(r"See more actions for\s+(.+)", label)
+                    name = match.group(1).strip() if match else label or f"lead-{button.id}"
+
+                    if name in seen_names:
+                        continue
+
+                    seen_names.add(name)
+                    candidates.append({"name": name, "button": button})
+                except Exception:
+                    continue
+
+            if candidates:
+                break
+
+        return candidates
+
+    def _dismiss_sales_nav_overlays(self, driver):
+        """Dismiss open Sales Navigator menus or modals between lead actions."""
+        try:
+            from selenium.webdriver.common.keys import Keys
+
+            body = driver.find_element(By.TAG_NAME, "body")
+            body.send_keys(Keys.ESCAPE)
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+    def _click_sales_nav_connect_action(self, driver):
+        """Click the Connect action from an opened Sales Navigator row menu."""
+        selectors = [
+            ("xpath", "//div[starts-with(@id, 'hue-menu-')]//*[self::button or @role='menuitem' or self::li][.//span[normalize-space()='Connect'] or normalize-space()='Connect']"),
+            ("xpath", "//*[@role='menuitem'][.//span[normalize-space()='Connect'] or normalize-space()='Connect']"),
+            ("xpath", "//button[.//span[normalize-space()='Connect']]"),
+            ("css", "button[aria-label*='Connect']"),
+        ]
+
+        for selector_type, selector in selectors:
+            try:
+                if selector_type == "xpath":
+                    elements = driver.find_elements(By.XPATH, selector)
+                else:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+
+                for element in elements:
+                    if not element.is_displayed():
+                        continue
+                    if self.safe_click(driver, element):
+                        return True
+                    driver.execute_script("arguments[0].click();", element)
+                    return True
+            except Exception:
+                continue
+
+        return False
+
+    def _advance_sales_nav_results(self, driver):
+        """Reveal more Sales Navigator results via scroll or pagination."""
+        try:
+            driver.execute_script("window.scrollBy(0, Math.max(window.innerHeight * 0.8, 600));")
+            time.sleep(2)
+        except Exception:
+            pass
+        return True
+
+    def _connect_with_sales_nav_result(self, driver, menu_button, lead_name):
+        """Open a Sales Nav row menu, click Connect, and send the invitation."""
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", menu_button)
+            time.sleep(1)
+
+            if not self.safe_click(driver, menu_button):
+                driver.execute_script("arguments[0].click();", menu_button)
+
+            time.sleep(1.5)
+            if not self._click_sales_nav_connect_action(driver):
+                logger.info(f"Skipping {lead_name}: no Connect action available in Sales Nav menu.")
+                self._dismiss_sales_nav_overlays(driver)
+                return "skipped"
+
+            time.sleep(2)
+            if self.handle_connect_modal(driver):
+                logger.info(f"✅ Sales Nav invitation sent to {lead_name}")
+                return "successful"
+
+            logger.info(f"Skipping {lead_name}: connect modal did not complete.")
+            self._dismiss_sales_nav_overlays(driver)
+            return "failed"
+        except Exception as e:
+            logger.error(f"Error connecting with {lead_name}: {e}")
+            self._dismiss_sales_nav_overlays(driver)
+            return "failed"
+
     def send_connection_request_with_note(self, driver, message, name):
         """Send connection request with personalized note"""
         from selenium.webdriver.common.by import By
@@ -1306,6 +2391,10 @@ Return ONLY the message text, no labels or formatting.
 
         # Find Connect button
         connect_button_selectors = [
+            ("xpath", "//span[normalize-space()='Connect']"),
+            ("xpath", "//*[contains(@class, 'artdeco-button') and .//span[normalize-space()='Connect']]"),
+            ("xpath", "//span[normalize-space()=\'Connect\']"),
+            ("xpath", "//*[contains(@class, \'artdeco-button\') and .//span[normalize-space()=\'Connect\']]"),
             ("css", "button.artdeco-button.artdeco-button--2.artdeco-button--primary[aria-label*='Connect']"),
             ("xpath", "//button[contains(@aria-label, 'Connect') and contains(@class, 'artdeco-button--primary')]"),
             ("xpath", "//button[.//span[text()='Connect']]"),
@@ -1328,6 +2417,8 @@ Return ONLY the message text, no labels or formatting.
         try:
             # Look for "Add a note" button
             add_note_selectors = [
+                ("xpath", "//button[.//span[normalize-space()='Add a note']]"),
+                ("xpath", "//button[.//span[normalize-space()=\'Add a note\']]"),
                 ("css", "button[aria-label='Add a note']"),
                 ("xpath", "//button[@aria-label='Add a note']"),
                 ("xpath", "//button[.//span[text()='Add a note']]"),
@@ -1392,15 +2483,20 @@ Return ONLY the message text, no labels or formatting.
     def send_connection_request_without_note(self, driver, name):
         """Send connection request without personalized note"""
         from selenium.webdriver.common.by import By
-        
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+
         logger.info(f"🤝 Attempting to send connection request without note to {name}...")
 
-        # Find Connect button (same logic as with note)
         connect_button_selectors = [
+            ("xpath", "//span[normalize-space()='Connect']"),
+            ("xpath", "//*[contains(@class, 'artdeco-button') and .//span[normalize-space()='Connect']]"),
+            ("xpath", "//span[normalize-space()=\'Connect\']"),
+            ("xpath", "//*[contains(@class, \'artdeco-button\') and .//span[normalize-space()=\'Connect\']]"),
             ("css", "button.artdeco-button.artdeco-button--2.artdeco-button--primary[aria-label*='Connect']"),
             ("xpath", "//button[contains(@aria-label, 'Connect') and contains(@class, 'artdeco-button--primary')]"),
             ("xpath", "//button[.//span[text()='Connect']]"),
-            ("css", "button[aria-label*='Connect'][class*='artdeco-button']")
+            ("css", "button[aria-label*='Connect'][class*='artdeco-button']"),
         ]
 
         connect_button = self.find_element_safe(driver, connect_button_selectors, timeout=8)
@@ -1408,34 +2504,26 @@ Return ONLY the message text, no labels or formatting.
             logger.error("❌ Connect button not found")
             return False
 
-        # Click Connect button
         if not self.safe_click(driver, connect_button):
             logger.error("❌ Failed to click Connect button")
             return False
 
         logger.info("✅ Connect button clicked")
-        self.human_delay(2, 3)
 
         try:
-            # Look for Send button (skip adding note)
-            send_request_selectors = [
-                ("css", "button[aria-label='Send now']"),
-                ("xpath", "//button[@aria-label='Send now']"),
-                ("css", "button[aria-label*='Send invitation']"),
-                ("xpath", "//button[contains(@aria-label, 'Send') and contains(@class, 'artdeco-button--primary')]"),
-                ("xpath", "//button[.//span[text()='Send']]"),
-                ("css", "button.artdeco-button--primary[aria-label*='Send']")
-            ]
-
-            send_button = self.find_element_safe(driver, send_request_selectors, timeout=10)
-            if send_button and self.safe_click(driver, send_button):
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((
+                    By.CSS_SELECTOR, 
+                    "div[data-test-modal-id='send-invite-modal'], .send-invite, #artdeco-modal-outlet .artdeco-modal"
+                ))
+            )
+            if self.click_send_without_note_button(driver, timeout=10):
                 logger.info(f"✅ Connection request without note sent successfully to {name}!")
                 self.human_delay(2, 4)
                 return True
-            else:
-                logger.error("❌ Could not find or click send button")
-                return False
 
+            logger.error("❌ Could not find or click send button")
+            return False
         except Exception as e:
             logger.error(f"❌ Error sending connection request without note: {e}")
             return False
@@ -1453,6 +2541,12 @@ Return ONLY the message text, no labels or formatting.
         # --- UPDATED SELECTOR LIST ---
         # Prioritizing the new 'pvs-sticky-header-profile-actions__action' class you found
         message_button_selectors = [
+            ("xpath", "//a[contains(@href, 'messaging/compose')]"),
+            ("xpath", "//a[.//span[normalize-space()='Message']]"),
+            ("xpath", "//span[normalize-space()='Message']"),
+            ("xpath", "//a[contains(@href, \'messaging/compose\')]"),
+            ("xpath", "//a[.//span[normalize-space()=\'Message\']]"),
+            ("xpath", "//span[normalize-space()=\'Message\']"),
             ("css", "button.pvs-sticky-header-profile-actions__action[aria-label*='Message']"),
             ("xpath", "//button[contains(@class, 'pvs-sticky-header-profile-actions__action') and contains(@aria-label, 'Message')]"),
             ("css", "button.artdeco-button--primary[aria-label*='Message']"),
@@ -1667,7 +2761,7 @@ Return ONLY the message text, no labels or formatting.
                         # Extract profile URL and Name
                         link_element = element.find_element(By.CSS_SELECTOR, "a.ember-view")
                         profile_url = link_element.get_attribute('href')
-                        name = element.find_element(By.css_selector, ".artdeco-entity-lockup__title").text.strip()
+                        name = element.find_element(By.CSS_SELECTOR, ".artdeco-entity-lockup__title").text.strip()
                         
                         # Skip if already collected or not a valid profile link
                         if not profile_url or "/sales/lead/" not in profile_url or profile_url in collected_urls:
@@ -1726,6 +2820,10 @@ Return ONLY the message text, no labels or formatting.
         """
         self.browser_lock.acquire()
         lists = []
+        self.active_sales_nav_fetches[task_id].update({
+            "status": "running",
+            "stop_requested": False
+        })
         try:
             logger.info(f"🔑 Browser lock acquired for fetching Sales Nav lists {task_id}")
             driver = self.get_shared_driver()
@@ -1736,6 +2834,10 @@ Return ONLY the message text, no labels or formatting.
             logger.info("Navigating to Sales Navigator Home...")
             driver.get("https://www.linkedin.com/sales/home")
             time.sleep(4)
+            if "premium/switcher" in driver.current_url:
+                raise Exception("sales_navigator_required")
+            if self.active_sales_nav_fetches[task_id].get("stop_requested"):
+                raise RuntimeError("Fetch stopped by user")
 
             # 2. Open Saved Searches
             # User provided: data-x--link--saved-searches
@@ -1746,10 +2848,14 @@ Return ONLY the message text, no labels or formatting.
             ])
             
             if not saved_searches_btn:
-                raise Exception("Could not find 'Saved Searches' button")
+                # If we're supposedly on sales nav but can't find core UI elements,
+                # the user probably doesn't have an active Sales Navigator subscription.
+                raise Exception("sales_navigator_required")
             
             self.safe_click(driver, saved_searches_btn)
             time.sleep(2)
+            if self.active_sales_nav_fetches[task_id].get("stop_requested"):
+                raise RuntimeError("Fetch stopped by user")
 
             # 3. Click "Leads" Tab
             # User provided: aria-label="Lead- View all lead saved searches"
@@ -1762,26 +2868,60 @@ Return ONLY the message text, no labels or formatting.
             if leads_tab:
                 self.safe_click(driver, leads_tab)
                 time.sleep(2)
+                if self.active_sales_nav_fetches[task_id].get("stop_requested"):
+                    raise RuntimeError("Fetch stopped by user")
 
             # 4. Scrape List Titles and URLs
             # User provided list html: class containing _panel-link_yma0zx
             logger.info("Scraping list data...")
-            list_elements = driver.find_elements(By.CSS_SELECTOR, "a[href*='/sales/lists/people']")
-            
-            for el in list_elements:
-                try:
-                    title = el.text.strip()
-                    url = el.get_attribute("href")
-                    # Clean up title if it contains counts (e.g., "My List (50)")
-                    if "\n" in title:
-                        title = title.split("\n")[0]
-                    
-                    if title and url:
-                        lists.append({"name": title, "url": url})
-                except:
-                    continue
+            selectors = [
+                "a._panel-link_yma0zx[href*='savedSearchId=']",
+                "a[href*='/sales/search/people?savedSearchId=']",
+                "a[aria-label*='Go to search results for']",
+            ]
+            lists_by_url = {}
+            stable_rounds = 0
+            previous_count = -1
+
+            for _ in range(12):
+                if self.active_sales_nav_fetches[task_id].get("stop_requested"):
+                    raise RuntimeError("Fetch stopped by user")
+
+                found_links = []
+                for selector in selectors:
+                    try:
+                        found_links.extend(driver.find_elements(By.CSS_SELECTOR, selector))
+                    except Exception:
+                        continue
+
+                for el in found_links:
+                    try:
+                        url = self._normalize_linkedin_url(el.get_attribute("href"))
+                        title = self._extract_sales_nav_list_name(el)
+                        if not url or not title:
+                            continue
+                        lists_by_url[url] = {"name": title, "url": url}
+                    except Exception:
+                        continue
+
+                current_count = len(lists_by_url)
+                if current_count == previous_count:
+                    stable_rounds += 1
+                else:
+                    stable_rounds = 0
+                    previous_count = current_count
+
+                if stable_rounds >= 2:
+                    break
+
+                self._scroll_sales_nav_saved_lists_panel(driver, found_links[-1] if found_links else None)
+                time.sleep(1.5)
+
+            lists = list(lists_by_url.values())
             
             logger.info(f"✅ Found {len(lists)} Sales Nav lists.")
+
+            self.active_sales_nav_fetches[task_id]["status"] = "completed"
 
             # Report results
             self.report_task_result({
@@ -1797,15 +2937,17 @@ Return ONLY the message text, no labels or formatting.
                 "task_id": task_id,
                 "type": "fetch_sales_nav_lists",
                 "success": False,
-                "error": str(e)
+                "error": str(e),
+                "payload": {"lists": [], "stopped": "stopped by user" in str(e).lower()}
             })
         finally:
+            if task_id in self.active_sales_nav_fetches:
+                del self.active_sales_nav_fetches[task_id]
             self.browser_lock.release()
 
-    def run_sales_nav_outreach_campaign(self, campaign_id, user_config, campaign_params):
+    def run_sales_nav_outreach_campaign(self, task_id, campaign_id, user_config, campaign_params):
         """
-        Iterates a specific Sales Nav list, messages leads, generates AI content, 
-        and waits for user approval via Dashboard.
+        Iterates a specific Sales Nav saved search and sends connection requests.
         """
         self.browser_lock.acquire()
         try:
@@ -1814,15 +2956,18 @@ Return ONLY the message text, no labels or formatting.
             
             # Initialize campaign state in self.active_campaigns
             self.active_campaigns[campaign_id] = {
+                'task_id': task_id,
                 'status': 'running',
                 'progress': 0,
                 'total': max_contacts,
                 'successful': 0,
                 'failed': 0,
                 'skipped': 0,
+                'already_messaged': 0,
                 'stop_requested': False,
                 'awaiting_confirmation': False,
                 'current_contact_preview': None,
+                'contacts': [],
                 'start_time': datetime.now().isoformat()
             }
 
@@ -1831,175 +2976,705 @@ Return ONLY the message text, no labels or formatting.
             logger.info(f"🚀 Starting Sales Nav Outreach on list: {list_url}")
             driver.get(list_url)
             time.sleep(5)
+            if "premium/switcher" in driver.current_url:
+                raise Exception("sales_navigator_required")
 
             processed_count = 0
-            
-            # Iterate through rows in the list
-            # We look for rows that contain a "Message" button
+            processed_leads = set()
+            exhausted_rounds = 0
+
             while processed_count < max_contacts:
                 if self.active_campaigns[campaign_id].get('stop_requested'):
                     break
 
-                # Re-fetch elements every loop to avoid stale elements
-                # Typical Sales Nav list row selector
-                rows = driver.find_elements(By.CSS_SELECTOR, "div.artdeco-list__item, tr.artdeco-list__item")
-                
-                # If we've processed rows on this page, we might need to scroll or paginate
-                # For MVP, we iterate visible rows.
-                
-                if processed_count >= len(rows):
-                    logger.info("Reached end of visible rows. (Pagination logic would go here)")
-                    break
-
-                row = rows[processed_count]
-                
                 try:
-                    # 1. Extract Info
-                    name_elem = row.find_element(By.CSS_SELECTOR, "[data-anonymize='person-name']")
-                    name = name_elem.text.strip()
-                    
-                    try:
-                        company_elem = row.find_element(By.CSS_SELECTOR, "[data-anonymize='company-name']")
-                        company = company_elem.text.strip()
-                    except:
-                        company = "their company"
-                    
-                    try:
-                        headline_elem = row.find_element(By.CSS_SELECTOR, "[data-anonymize='job-title']")
-                        role = headline_elem.text.strip()
-                    except:
-                        role = "Professional"
+                    candidates = self._get_sales_nav_result_candidates(driver)
+                    candidate = next(
+                        (item for item in candidates if item['name'] not in processed_leads),
+                        None
+                    )
 
-                    logger.info(f"👉 Processing Lead: {name} at {company}")
+                    if not candidate:
+                        exhausted_rounds += 1
+                        if exhausted_rounds == 2 and self.go_to_next_page(driver):
+                            time.sleep(3)
+                            continue
+                        if exhausted_rounds >= 3:
+                            logger.info("Reached end of visible Sales Nav results.")
+                            break
+                        self._advance_sales_nav_results(driver)
+                        continue
 
-                    # 2. Find and Click Message Button
-                    # User provided: data-anchor-send-message
-                    msg_btn = row.find_element(By.CSS_SELECTOR, "button[data-anchor-send-message]")
-                    
-                    # Scroll to button
-                    driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", msg_btn)
-                    time.sleep(1)
-                    
-                    self.safe_click(driver, msg_btn)
-                    time.sleep(3) # Wait for chat window/drawer
+                    exhausted_rounds = 0
+                    lead_name = candidate['name']
+                    processed_leads.add(lead_name)
+                    logger.info(f"👉 Processing Sales Nav lead: {lead_name}")
 
-                    # 3. Check if we have history (Optional safety check)
-                    # If there are previous messages from 'You', maybe skip?
-                    # For now, we proceed to generate message.
-
-                    # 4. Generate AI Message
-                    message = self.generate_message(name, company, role, "", "") # Reusing existing logic
-
-                    # 5. ============ APPROVAL FLOW ============
-                    # Prepare preview data
-                    contact_info = {'Name': name, 'Company': company, 'Role': role, 'LinkedIn_profile': 'Sales Nav List'}
-                    
-                    self.active_campaigns[campaign_id]['awaiting_confirmation'] = True
-                    self.active_campaigns[campaign_id]['current_contact_preview'] = {
-                        'contact': contact_info,
-                        'message': message,
-                        'contact_index': processed_count
-                    }
-                    
-                    # Report to dashboard so UI updates
-                    self.report_progress_to_dashboard(campaign_id)
-                    logger.info(f"⏳ Waiting for approval for {name}...")
-
-                    # Wait Loop
-                    start_wait = time.time()
-                    user_decision = None
-                    while time.time() - start_wait < 300: # 5 min timeout
-                         if self.active_campaigns[campaign_id].get('stop_requested'): break
-                         user_decision = self.active_campaigns[campaign_id].get('user_action')
-                         if user_decision: break
-                         time.sleep(1)
-
-                    # Reset Wait State
-                    self.active_campaigns[campaign_id]['awaiting_confirmation'] = False
-                    self.active_campaigns[campaign_id]['current_contact_preview'] = None
-                    self.active_campaigns[campaign_id]['user_action'] = None
-
-                    action = user_decision.get('action') if user_decision else 'skip'
-
-                    if action in ['send', 'edit']:
-                        final_msg = user_decision.get('message', message) if user_decision else message
-                        
-                        # 6. Type and Send
-                        # Find the active message box in Sales Nav
-                        # Sales Nav input is often textarea[name='message'] or div[contenteditable]
-                        input_box = self.find_element_safe(driver, [
-                            ("css", "textarea[name='message']"),
-                            ("css", "div[role='textbox'][contenteditable='true']")
-                        ])
-                        
-                        if input_box:
-                            input_box.clear()
-                            self.type_like_human(input_box, final_msg)
-                            time.sleep(1)
-                            
-                            # Find Send Button
-                            send_btn = self.find_element_safe(driver, [
-                                ("css", "button[type='submit']"),
-                                ("xpath", "//button[contains(text(), 'Send')]")
-                            ])
-                            
-                            if send_btn:
-                                self.safe_click(driver, send_btn)
-                                self.active_campaigns[campaign_id]['successful'] += 1
-                                logger.info(f"✅ Message sent to {name}")
-                            else:
-                                logger.error("Send button not found")
-                        else:
-                            logger.error("Input box not found")
-                        
-                        # Close chat window to clean up
-                        try:
-                            close_icon = driver.find_element(By.CSS_SELECTOR, "button[aria-label*='Close']")
-                            close_icon.click()
-                        except: pass
-
-                    else:
-                        logger.info(f"⏭️ Skipped {name}")
-                        self.active_campaigns[campaign_id]['skipped'] += 1
-                        # Close chat if opened
-                        try:
-                            close_icon = driver.find_element(By.CSS_SELECTOR, "button[aria-label*='Close']")
-                            close_icon.click()
-                        except: pass
-                    
+                    outcome = self._connect_with_sales_nav_result(
+                        driver,
+                        candidate['button'],
+                        lead_name
+                    )
+                    self.active_campaigns[campaign_id][outcome] += 1
+                    self.active_campaigns[campaign_id]['contacts'].append({
+                        'Name': lead_name,
+                        'Company': '',
+                        'Role': '',
+                        'LinkedIn_profile': list_url,
+                        'status': outcome
+                    })
                 except Exception as e:
                     logger.error(f"Error processing row {processed_count}: {e}")
                     self.active_campaigns[campaign_id]['failed'] += 1
 
                 processed_count += 1
                 self.active_campaigns[campaign_id]['progress'] = processed_count
-                self.report_progress_to_dashboard(campaign_id)
-                time.sleep(random.uniform(3, 6))
+                self.report_progress_to_dashboard(campaign_id, task_id=task_id, task_type='sales_nav_outreach_campaign')
+                time.sleep(random.uniform(2, 4))
 
-            # Final Report
-            self.report_progress_to_dashboard(campaign_id, final=True)
+            self.active_campaigns[campaign_id]['status'] = 'stopped' if self.active_campaigns[campaign_id].get('stop_requested') else 'completed'
+            self.active_campaigns[campaign_id]['end_time'] = datetime.now().isoformat()
+            self.report_progress_to_dashboard(
+                campaign_id,
+                final=True,
+                task_id=task_id,
+                task_type='sales_nav_outreach_campaign'
+            )
 
         except Exception as e:
             logger.error(f"Critical error in Sales Nav campaign: {e}")
             self.active_campaigns[campaign_id]['status'] = 'failed'
-            self.report_progress_to_dashboard(campaign_id, final=True)
+            self.active_campaigns[campaign_id]['error'] = str(e)
+            self.report_progress_to_dashboard(
+                campaign_id,
+                final=True,
+                task_id=task_id,
+                task_type='sales_nav_outreach_campaign'
+            )
         finally:
             self.browser_lock.release()
 
-    def search_and_connect(self, driver, keywords, max_invites=20, search_id=None):
+    def _parse_keyword_search_list(self, raw_value):
+        """Normalize comma/newline separated filter input into a clean list."""
+        if not raw_value:
+            return []
+        if isinstance(raw_value, (list, tuple, set)):
+            parts = raw_value
+        else:
+            parts = re.split(r'[\r\n,;]+', str(raw_value))
+        return [part.strip() for part in parts if part and str(part).strip()]
+
+    def normalize_keyword_search_filters(self, search_filters=None):
+        """Return only populated keyword-search filters in a predictable shape."""
+        search_filters = search_filters or {}
+        normalized = {
+            "location": str(search_filters.get("location", "")).strip(),
+            "connection_degrees": self._parse_keyword_search_list(search_filters.get("connection_degrees", [])),
+            "industries": self._parse_keyword_search_list(search_filters.get("industries", search_filters.get("industry", []))),
+            "current_companies": self._parse_keyword_search_list(search_filters.get("current_companies", [])),
+            "past_companies": self._parse_keyword_search_list(search_filters.get("past_companies", [])),
+            "schools": self._parse_keyword_search_list(search_filters.get("schools", [])),
+            "profile_languages": self._parse_keyword_search_list(search_filters.get("profile_languages", [])),
+            "service_categories": self._parse_keyword_search_list(search_filters.get("service_categories", [])),
+            "filter_keywords": str(search_filters.get("filter_keywords", search_filters.get("keywords_filter", ""))).strip(),
+            "first_name": str(search_filters.get("first_name", "")).strip(),
+            "last_name": str(search_filters.get("last_name", "")).strip(),
+            "title": str(search_filters.get("title", "")).strip(),
+            "company": str(search_filters.get("company", "")).strip(),
+            "school": str(search_filters.get("school", "")).strip(),
+        }
+        return {
+            key: value for key, value in normalized.items()
+            if value not in ("", None, [])
+        }
+
+    def _normalize_location_lookup_key(self, location_value):
+        return re.sub(r"[^a-z0-9]+", " ", str(location_value).lower()).strip()
+
+    def _find_broader_geo_urn(self, raw_location):
+        normalized_key = self._normalize_location_lookup_key(raw_location)
+        if not normalized_key:
+            return None, None
+
+        # Try suffix candidates so "Paris, France" can fall back to "France"
+        # and "Toronto Ontario Canada" can still resolve to "Canada".
+        comma_segments = [
+            self._normalize_location_lookup_key(part)
+            for part in re.split(r"[|,/]+", str(raw_location))
+            if self._normalize_location_lookup_key(part)
+        ]
+        candidates = []
+
+        if comma_segments:
+            for index in range(len(comma_segments)):
+                candidate = " ".join(comma_segments[index:]).strip()
+                if candidate and candidate not in candidates:
+                    candidates.append(candidate)
+
+        token_segments = normalized_key.split()
+        for index in range(len(token_segments)):
+            candidate = " ".join(token_segments[index:]).strip()
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+
+        for candidate in candidates:
+            geo_urn = LINKEDIN_GEO_URN_BY_LOCATION.get(candidate)
+            if geo_urn:
+                return geo_urn, candidate
+
+        return None, None
+
+    def _resolve_geo_urns(self, location_value):
+        resolved = []
+        unresolved = []
+
+        for location in self._parse_keyword_search_list(location_value):
+            raw_location = str(location).strip()
+            if not raw_location:
+                continue
+
+            urn_match = re.search(r"(\d{6,})", raw_location)
+            if urn_match:
+                resolved.append(urn_match.group(1))
+                continue
+
+            lookup_key = self._normalize_location_lookup_key(raw_location)
+            geo_urn = LINKEDIN_GEO_URN_BY_LOCATION.get(lookup_key)
+            if geo_urn:
+                resolved.append(geo_urn)
+            else:
+                fallback_geo_urn, matched_candidate = self._find_broader_geo_urn(raw_location)
+                if fallback_geo_urn:
+                    logger.info(
+                        f"Using broader geo fallback '{matched_candidate}' for location '{raw_location}'."
+                    )
+                    resolved.append(fallback_geo_urn)
+                else:
+                    unresolved.append(raw_location)
+
+        deduped = []
+        seen = set()
+        for value in resolved:
+            if value not in seen:
+                deduped.append(value)
+                seen.add(value)
+
+        return deduped, unresolved
+
+    def _resolve_profile_language_codes(self, language_value):
+        resolved = []
+        unresolved = []
+
+        for language in self._parse_keyword_search_list(language_value):
+            raw_language = str(language).strip()
+            if not raw_language:
+                continue
+
+            lookup_key = self._normalize_location_lookup_key(raw_language)
+            language_code = LINKEDIN_PROFILE_LANGUAGE_CODE_BY_NAME.get(lookup_key)
+            if language_code:
+                resolved.append(language_code)
+            else:
+                unresolved.append(raw_language)
+
+        deduped = []
+        seen = set()
+        for value in resolved:
+            if value not in seen:
+                deduped.append(value)
+                seen.add(value)
+
+        return deduped, unresolved
+
+    def _resolve_numeric_filter_values(self, raw_values):
+        resolved = []
+        unresolved = []
+
+        for raw_value in self._parse_keyword_search_list(raw_values):
+            cleaned_value = str(raw_value).strip()
+            if not cleaned_value:
+                continue
+
+            matched_ids = re.findall(r"(?<!\d)(\d{2,})(?!\d)", cleaned_value)
+            if matched_ids:
+                for matched_id in matched_ids:
+                    if matched_id not in resolved:
+                        resolved.append(matched_id)
+                continue
+
+            unresolved.append(cleaned_value)
+
+        return resolved, unresolved
+
+    def _merge_keyword_search_terms(self, keywords, normalized_filters, fallback_terms=None):
+        terms = [str(keywords).strip()]
+
+        if normalized_filters.get("filter_keywords"):
+            terms.append(normalized_filters["filter_keywords"])
+
+        terms.extend(fallback_terms or [])
+
+        merged_terms = []
+        seen = set()
+        for term in terms:
+            cleaned = str(term).strip()
+            if not cleaned:
+                continue
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            merged_terms.append(cleaned)
+            seen.add(key)
+
+        return " ".join(merged_terms)
+
+    def build_people_search_url(self, keywords, search_filters=None):
+        normalized_filters = self.normalize_keyword_search_filters(search_filters)
+        fallback_keyword_terms = []
+
+        params = {
+            "origin": "FACETED_SEARCH" if normalized_filters else "GLOBAL_SEARCH_HEADER",
+        }
+
+        network_codes = []
+        for degree in normalized_filters.get("connection_degrees", []):
+            code = LINKEDIN_NETWORK_CODE_BY_DEGREE.get(str(degree).strip().lower().replace(" ", ""), None)
+            if code and code not in network_codes:
+                network_codes.append(code)
+
+        if network_codes:
+            params["network"] = json.dumps(network_codes, separators=(",", ":"))
+
+        geo_urns, unresolved_locations = self._resolve_geo_urns(normalized_filters.get("location", ""))
+        if geo_urns:
+            params["geoUrn"] = json.dumps(geo_urns, separators=(",", ":"))
+
+        if unresolved_locations:
+            logger.warning(
+                f"⚠️ No geoUrn mapping found for locations {unresolved_locations}. "
+                "They were not added as direct LinkedIn location filters."
+            )
+
+        profile_language_codes, unresolved_languages = self._resolve_profile_language_codes(
+            normalized_filters.get("profile_languages", [])
+        )
+        if profile_language_codes:
+            params["profileLanguage"] = json.dumps(profile_language_codes, separators=(",", ":"))
+
+        if unresolved_languages:
+            logger.warning(
+                f"⚠️ No profileLanguage mapping found for languages {unresolved_languages}. "
+                "They were not added as direct LinkedIn language filters."
+            )
+            fallback_keyword_terms.extend(unresolved_languages)
+
+        list_filter_param_map = {
+            "current_companies": "currentCompany",
+            "industries": "industry",
+            "schools": "schoolFilter",
+            "past_companies": "pastCompany",
+            "service_categories": "serviceCategory",
+        }
+        for filter_name, param_name in list_filter_param_map.items():
+            resolved_ids, unresolved_values = self._resolve_numeric_filter_values(
+                normalized_filters.get(filter_name, [])
+            )
+            if resolved_ids:
+                params[param_name] = json.dumps(resolved_ids, separators=(",", ":"))
+            if unresolved_values:
+                fallback_keyword_terms.extend(unresolved_values)
+                logger.info(
+                    f"ℹ️ Using keyword fallback for unresolved {filter_name}: {unresolved_values}"
+                )
+
+        direct_param_map = {
+            "first_name": "firstName",
+            "last_name": "lastName",
+            "title": "title",
+            "company": "company",
+            "school": "school",
+        }
+        for filter_name, param_name in direct_param_map.items():
+            if normalized_filters.get(filter_name):
+                params[param_name] = normalized_filters[filter_name]
+
+        params["keywords"] = self._merge_keyword_search_terms(
+            keywords,
+            normalized_filters,
+            fallback_terms=fallback_keyword_terms
+        )
+
+        return f"https://www.linkedin.com/search/results/people/?{urlencode(params, quote_via=quote)}"
+
+    def _find_filter_input_by_labels(self, driver, dialog, labels):
+        """Find a visible input/select/textarea whose nearby label matches."""
+        if isinstance(labels, str):
+            labels = [labels]
+
+        script = """
+            const root = arguments[0];
+            const labels = arguments[1].map(label =>
+                (label || '').replace(/\\s+/g, ' ').trim().toLowerCase()
+            ).filter(Boolean);
+
+            function normalize(value) {
+                return (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            }
+
+            function isVisible(el) {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                return style &&
+                    style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    el.offsetParent !== null;
+            }
+
+            function labelTextFor(control) {
+                const bits = [];
+                if (control.labels) {
+                    bits.push(...Array.from(control.labels).map(node => node.textContent || ''));
+                }
+
+                const labelledBy = (control.getAttribute('aria-labelledby') || '').trim();
+                if (labelledBy) {
+                    for (const id of labelledBy.split(/\\s+/)) {
+                        const node = root.ownerDocument.getElementById(id);
+                        if (node) bits.push(node.textContent || '');
+                    }
+                }
+
+                for (const attr of ['aria-label', 'placeholder', 'name', 'id']) {
+                    bits.push(control.getAttribute(attr) || '');
+                }
+
+                let node = control.parentElement;
+                for (let depth = 0; depth < 4 && node; depth += 1, node = node.parentElement) {
+                    bits.push(node.textContent || '');
+                }
+
+                return bits.map(normalize).filter(Boolean);
+            }
+
+            let best = null;
+            let bestScore = 0;
+            const controls = Array.from(root.querySelectorAll('input, textarea, select, [contenteditable="true"]'));
+
+            for (const control of controls) {
+                if (!isVisible(control)) continue;
+
+                const texts = labelTextFor(control);
+                let score = 0;
+                for (const text of texts) {
+                    for (const wanted of labels) {
+                        if (!wanted) continue;
+                        if (text === wanted) {
+                            score = Math.max(score, 100);
+                        } else if (text.includes(wanted)) {
+                            score = Math.max(score, 80);
+                        } else if (wanted.length > 4 && wanted.includes(text)) {
+                            score = Math.max(score, 60);
+                        }
+                    }
+                }
+
+                if (score > bestScore) {
+                    best = control;
+                    bestScore = score;
+                }
+            }
+
+            return bestScore >= 60 ? best : null;
+        """
+        try:
+            return driver.execute_script(script, dialog, labels)
+        except Exception as exc:
+            logger.debug(f"Could not locate filter input for {labels}: {exc}")
+            return None
+
+    def _set_filter_input_value(self, driver, element, value, prefer_selection=False):
+        """Populate a filter input and optionally confirm an autosuggest selection."""
+        from selenium.webdriver.common.keys import Keys
+
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+        except Exception:
+            pass
+
+        try:
+            element.click()
+        except Exception:
+            pass
+
+        try:
+            tag_name = (element.tag_name or "").lower()
+            is_contenteditable = (element.get_attribute("contenteditable") or "").lower() == "true"
+
+            if is_contenteditable:
+                driver.execute_script(
+                    "arguments[0].textContent=''; arguments[0].dispatchEvent(new Event('input', {bubbles:true}));",
+                    element
+                )
+            elif tag_name in {"input", "textarea"}:
+                element.send_keys(Keys.CONTROL, "a")
+                element.send_keys(Keys.DELETE)
+            else:
+                driver.execute_script(
+                    "arguments[0].value=''; arguments[0].dispatchEvent(new Event('input', {bubbles:true}));",
+                    element
+                )
+        except Exception:
+            logger.debug("Primary input clear failed, falling back to JavaScript clear.")
+            try:
+                driver.execute_script(
+                    """
+                    if (arguments[0].isContentEditable) {
+                        arguments[0].textContent = '';
+                    } else {
+                        arguments[0].value = '';
+                    }
+                    arguments[0].dispatchEvent(new Event('input', {bubbles:true}));
+                    arguments[0].dispatchEvent(new Event('change', {bubbles:true}));
+                    """,
+                    element
+                )
+            except Exception:
+                pass
+
+        try:
+            element.send_keys(value)
+        except Exception:
+            driver.execute_script(
+                """
+                if (arguments[0].isContentEditable) {
+                    arguments[0].textContent = arguments[1];
+                } else {
+                    arguments[0].value = arguments[1];
+                }
+                arguments[0].dispatchEvent(new Event('input', {bubbles:true}));
+                arguments[0].dispatchEvent(new Event('change', {bubbles:true}));
+                """,
+                element,
+                value
+            )
+
+        self.human_delay(0.5, 1.0)
+
+        if prefer_selection:
+            for keys in ((Keys.ARROW_DOWN, Keys.ENTER), (Keys.ENTER,), (Keys.TAB,)):
+                try:
+                    element.send_keys(*keys)
+                    self.human_delay(0.3, 0.7)
+                    break
+                except Exception:
+                    continue
+
+    def _find_filter_option(self, driver, dialog, option_labels):
+        """Find a clickable option in the filter modal by visible text."""
+        if isinstance(option_labels, str):
+            option_labels = [option_labels]
+
+        script = """
+            const root = arguments[0];
+            const labels = arguments[1].map(label =>
+                (label || '').replace(/\\s+/g, ' ').trim().toLowerCase()
+            ).filter(Boolean);
+
+            function normalize(value) {
+                return (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            }
+
+            function isVisible(el) {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                return style &&
+                    style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    el.offsetParent !== null;
+            }
+
+            const selectors = [
+                'label',
+                'button',
+                '[role="checkbox"]',
+                '[role="radio"]',
+                '.artdeco-pill',
+                '.search-reusables__filter-pill-button'
+            ];
+
+            for (const selector of selectors) {
+                const nodes = Array.from(root.querySelectorAll(selector));
+                for (const node of nodes) {
+                    if (!isVisible(node)) continue;
+                    const text = normalize(node.innerText || node.textContent || '');
+                    if (!text) continue;
+                    if (!labels.some(label => text === label || text.includes(label))) continue;
+                    return node;
+                }
+            }
+
+            return null;
+        """
+        try:
+            return driver.execute_script(script, dialog, option_labels)
+        except Exception as exc:
+            logger.debug(f"Could not locate filter option {option_labels}: {exc}")
+            return None
+
+    def _is_filter_option_selected(self, driver, option):
+        try:
+            return bool(driver.execute_script(
+                """
+                const option = arguments[0];
+                const input = option.matches('input') ? option : option.querySelector('input[type="checkbox"], input[type="radio"]');
+                if (input) return !!input.checked;
+
+                const ariaChecked = option.getAttribute('aria-checked');
+                if (ariaChecked) return ariaChecked === 'true';
+
+                const ariaPressed = option.getAttribute('aria-pressed');
+                if (ariaPressed) return ariaPressed === 'true';
+
+                return option.classList.contains('artdeco-pill--selected') ||
+                    option.classList.contains('selected') ||
+                    option.classList.contains('artdeco-toggle__button--selected');
+                """,
+                option
+            ))
+        except Exception:
+            return False
+
+    def _apply_people_search_filters(self, driver, search_filters):
+        """Apply optional LinkedIn people-search filters from the all-filters modal."""
+        normalized_filters = self.normalize_keyword_search_filters(search_filters)
+        if not normalized_filters:
+            return {}
+
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+
+        logger.info(f"🔧 Applying keyword search filters: {normalized_filters}")
+
+        try:
+            filter_button = None
+            filter_selectors = [
+                (By.XPATH, "//button[contains(normalize-space(.), 'All filters')]"),
+                (By.XPATH, "//button[contains(@aria-label, 'All filters')]"),
+                (By.CSS_SELECTOR, "button.search-reusables__all-filters-pill-button"),
+            ]
+
+            for by, selector in filter_selectors:
+                try:
+                    filter_button = WebDriverWait(driver, 8).until(
+                        EC.element_to_be_clickable((by, selector))
+                    )
+                    if filter_button:
+                        break
+                except Exception:
+                    continue
+
+            if not filter_button:
+                logger.warning("⚠️ Could not find the LinkedIn All filters button. Continuing without optional filters.")
+                return normalized_filters
+
+            self.safe_click(driver, filter_button)
+            dialog = self._find_active_connect_dialog(driver, timeout=8)
+            if not dialog:
+                logger.warning("⚠️ LinkedIn filter dialog did not open. Continuing without optional filters.")
+                return normalized_filters
+
+            field_configs = [
+                ("location", ["Locations", "Location"], "multi"),
+                ("industries", ["Industry", "Industries"], "multi"),
+                ("current_companies", ["Current company", "Current companies"], "multi"),
+                ("past_companies", ["Past company", "Past companies"], "multi"),
+                ("schools", ["Schools", "School"], "multi"),
+                ("profile_languages", ["Profile language", "Profile languages", "Language"], "multi"),
+                ("service_categories", ["Service categories", "Service category", "Services"], "multi"),
+                ("filter_keywords", ["Keywords", "Keyword"], "single"),
+                ("first_name", ["First name"], "single"),
+                ("last_name", ["Last name"], "single"),
+                ("title", ["Title"], "single"),
+                ("company", ["Company"], "single"),
+                ("school", ["School"], "single"),
+            ]
+
+            for degree in normalized_filters.get("connection_degrees", []):
+                option = self._find_filter_option(driver, dialog, [degree, degree.replace("+", " and beyond")])
+                if not option:
+                    logger.warning(f"⚠️ Could not find degree filter option '{degree}'.")
+                    continue
+                if not self._is_filter_option_selected(driver, option):
+                    self.safe_click(driver, option)
+                    self.human_delay(0.3, 0.7)
+
+            for field_name, labels, field_mode in field_configs:
+                field_value = normalized_filters.get(field_name)
+                if not field_value:
+                    continue
+
+                values = field_value if isinstance(field_value, list) else [field_value]
+                input_found = False
+
+                for value in values:
+                    input_element = self._find_filter_input_by_labels(driver, dialog, labels)
+                    if not input_element:
+                        if not input_found:
+                            logger.warning(f"⚠️ Could not find filter field for {field_name}.")
+                        break
+
+                    input_found = True
+                    self._set_filter_input_value(
+                        driver,
+                        input_element,
+                        value,
+                        prefer_selection=(field_mode == "multi")
+                    )
+
+            submit_button = None
+            submit_selectors = [
+                (By.XPATH, "//button[contains(normalize-space(.), 'Show results')]"),
+                (By.XPATH, "//button[contains(@aria-label, 'Show results')]"),
+                (By.XPATH, "//button[contains(normalize-space(.), 'Apply')]"),
+            ]
+            for by, selector in submit_selectors:
+                try:
+                    submit_button = WebDriverWait(dialog, 5).until(
+                        EC.element_to_be_clickable((by, selector))
+                    )
+                    if submit_button:
+                        break
+                except Exception:
+                    continue
+
+            if submit_button:
+                self.safe_click(driver, submit_button)
+                self.human_delay(2, 4)
+            else:
+                logger.warning("⚠️ Could not find the filter apply button. Leaving the search as-is.")
+
+        except Exception as exc:
+            logger.warning(f"⚠️ Failed while applying LinkedIn search filters: {exc}")
+
+        return normalized_filters
+
+    def search_and_connect(self, driver, keywords, max_invites=20, search_id=None, search_filters=None):
         """Search for profiles and send connection requests"""
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
-        from selenium.common.exceptions import TimeoutException
-        from urllib.parse import quote_plus
+        from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
         
         logger.info(f"🔍 Searching for: {keywords}")
-        url = (f"https://www.linkedin.com/search/results/people/"
-               f"?keywords={quote_plus(keywords)}&origin=GLOBAL_SEARCH_HEADER")
+        normalized_filters = self.normalize_keyword_search_filters(search_filters)
+        url = self.build_people_search_url(keywords, normalized_filters)
+        logger.info(f"🔗 Search URL: {url}")
         
         driver.get(url)
         self.human_delay(4, 7)
+        if normalized_filters:
+            logger.info("🧭 Optional search filters were requested for this search.")
         sent_count = 0
         page_loops = 0
         total_attempts = 0
@@ -2011,6 +3686,7 @@ Return ONLY the message text, no labels or formatting.
                 break
                 
             logger.info(f"📊 Current status: {sent_count}/{max_invites} invitations sent")
+            should_rescan_current_page = False
             
             # Find connect buttons
             self.human_delay(2, 4)
@@ -2043,15 +3719,27 @@ Return ONLY the message text, no labels or formatting.
                         sent_count += 1
                         logger.info(f"✅ Success! Sent invitation #{sent_count}/{max_invites}")
                         time.sleep(random.uniform(2, 4))
+                        # Re-scan this same page because the DOM may have reloaded or button states changed.
+                        should_rescan_current_page = True
+                        break
                     else:
                         logger.info(f"❌ Failed to send invitation (attempt #{total_attempts})")
+                except StaleElementReferenceException:
+                    logger.info("🔄 Button references went stale (page reloaded), re-scanning...")
+                    should_rescan_current_page = True
+                    break
                 except Exception as e:
-                    logger.debug(f"Exception during connection attempt: {e}")
+                    logger.error(f"❌ Exception during connection attempt: {e}", exc_info=True)
                     continue
             
             # Check for stop before navigating to next page
             if search_id and self.active_searches[search_id].get('stop_requested'):
                 break
+
+            if should_rescan_current_page:
+                logger.info("🔁 Re-scanning the current page for remaining connect buttons.")
+                self.human_delay(1, 2)
+                continue
 
             # Navigate to next page
             if not self.go_to_next_page(driver):
@@ -2073,12 +3761,14 @@ Return ONLY the message text, no labels or formatting.
             logger.info(f"🔑 Browser lock acquired for search task {search_id}")
             
             # --- FIX: Initialize the search state so it can be stopped ---
+            search_filters = self.normalize_keyword_search_filters(search_params.get('filters', {}))
             self.active_searches[search_id] = {
                 "status": "running",
                 "stop_requested": False,
                 "keywords": search_params.get('keywords', ''),
                 "max_invites": search_params.get('max_invites', 10),
                 "invites_sent": 0,
+                "filters": search_filters,
             }
             # --- End of Fix ---
 
@@ -2103,7 +3793,7 @@ Return ONLY the message text, no labels or formatting.
                 del self.active_searches[search_id]
             self.browser_lock.release()
 
-    def execute_outreach_task(self, campaign_id, user_config, campaign_data):
+    def execute_outreach_task(self, task_id, campaign_id, user_config, campaign_data):
         """A thread-safe wrapper to execute an outreach campaign."""
         self.browser_lock.acquire()
         try:
@@ -2113,13 +3803,13 @@ Return ONLY the message text, no labels or formatting.
                 raise Exception("Failed to get a valid browser session for the campaign.")
             
             # Pass the shared driver to the campaign logic
-            self.run_enhanced_outreach_campaign(driver, campaign_id, user_config, campaign_data)
+            self.run_enhanced_outreach_campaign(driver, task_id, campaign_id, user_config, campaign_data)
 
         except Exception as e:
             logger.error(f"❌ A critical error occurred in outreach campaign {campaign_id}: {e}", exc_info=True)
             self.active_campaigns[campaign_id]['status'] = 'failed'
             self.active_campaigns[campaign_id]['error'] = str(e)
-            self.report_progress_to_dashboard(campaign_id, final=True)
+            self.report_progress_to_dashboard(campaign_id, final=True, task_id=task_id)
         finally:
             logger.info(f"🔑 Browser lock released for outreach campaign {campaign_id}")
             self.browser_lock.release()
@@ -2175,155 +3865,654 @@ Return ONLY the message text, no labels or formatting.
             self.browser_lock.release()
 
     def find_connect_buttons_enhanced(self, driver):
-        """Find connect buttons with updated 2025 detection"""
+        """Find connect buttons with updated 2025 LinkedIn detection.
+        
+        LinkedIn now uses aria-label='Invite [Name] to connect' on the button
+        rather than a visible 'Connect' text node, so we must search by aria-label.
+        """
         from selenium.webdriver.common.by import By
-        
-        buttons = []
-        
-        # Strategy 1: Find ALL buttons and filter by text content (most reliable)
-        try:
-            all_buttons = driver.find_elements(By.TAG_NAME, "button")
-            for btn in all_buttons:
+
+        if not self._wait_for_people_results(driver, timeout=10):
+            logger.info("People results did not finish rendering before button scan.")
+
+        deadline = time.time() + 8
+        last_count = 0
+
+        while time.time() < deadline:
+            buttons = []
+
+            # Strategy 1: CSS – fastest, matches aria-label pattern "Invite … to connect"
+            css_selectors = [
+                "button[aria-label*='to connect']",
+                "button[aria-label*='Connect']",
+                "a[aria-label*='to connect']",
+            ]
+            for css in css_selectors:
                 try:
-                    btn_text = btn.text.strip()
-                    # Check if button text is exactly "Connect"
-                    if btn_text == "Connect":
+                    found = driver.find_elements(By.CSS_SELECTOR, css)
+                    for btn in found:
                         if btn.is_displayed() and btn.is_enabled():
-                            # Verify it's not in a "Pending" state container
                             parent_text = ""
                             try:
-                                parent = btn.find_element(By.XPATH, "./ancestor::*[contains(@class, 'entity-result__actions')]")
+                                parent = btn.find_element(
+                                    By.XPATH,
+                                    "./ancestor::li[1] | ./ancestor::div[contains(@class,'entity-result')][1]"
+                                )
                                 parent_text = parent.text
-                            except:
+                            except Exception:
                                 pass
-                            
-                            if "Pending" not in parent_text:
+                            if "Pending" not in parent_text and "Following" not in parent_text:
                                 buttons.append(btn)
                 except Exception as e:
-                    continue
-        except Exception as e:
-            logger.debug(f"Strategy 1 (all buttons) failed: {e}")
-        
-        # Strategy 2: Use aria-label selector
-        if not buttons:
-            try:
-                aria_buttons = driver.find_elements(By.CSS_SELECTOR, "button[aria-label*='Invite'][aria-label*='to connect']")
-                for btn in aria_buttons:
-                    if btn.is_displayed() and btn.is_enabled():
-                        buttons.append(btn)
-            except Exception as e:
-                logger.debug(f"Strategy 2 (aria-label) failed: {e}")
-        
-        # Strategy 3: Look in entity-result__actions container
-        if not buttons:
-            try:
-                action_containers = driver.find_elements(By.CSS_SELECTOR, ".entity-result__actions")
-                for container in action_containers:
+                    logger.debug(f"CSS selector failed: {css}, e: {e}")
+                if buttons:
+                    break
+
+            # Strategy 2: XPath fallbacks (older LinkedIn UI / "Connect" span text)
+            if not buttons:
+                xpath_selectors = [
+                    "//button[.//span[normalize-space()='Connect']]",
+                    "//button[@aria-label and contains(@aria-label, 'connect')]",
+                    "//div[@role='button' and .//span[normalize-space()='Connect']]",
+                ]
+                for xpath in xpath_selectors:
                     try:
-                        connect_btns = container.find_elements(By.TAG_NAME, "button")
-                        for btn in connect_btns:
-                            if btn.text.strip() == "Connect" and btn.is_displayed():
-                                buttons.append(btn)
-                    except:
-                        continue
-            except Exception as e:
-                logger.debug(f"Strategy 3 (action containers) failed: {e}")
-        
-        unique_buttons = list(dict.fromkeys(buttons))
-        logger.info(f"Found {len(unique_buttons)} available connect buttons")
-        return unique_buttons
+                        found = driver.find_elements(By.XPATH, xpath)
+                        for btn in found:
+                            if btn.is_displayed() and btn.is_enabled():
+                                parent_text = ""
+                                try:
+                                    parent = btn.find_element(By.XPATH, "./ancestor::li[1]")
+                                    parent_text = parent.text
+                                except Exception:
+                                    pass
+                                if "Pending" not in parent_text and "Following" not in parent_text:
+                                    buttons.append(btn)
+                    except Exception as e:
+                        logger.debug(f"XPath selector failed: {xpath}, e: {e}")
+                    if buttons:
+                        break
 
-    def click_connect_and_validate(self, driver, button):
-        """Click connect button and validate success"""
+            seen_ids = set()
+            unique_buttons = []
+            for btn in buttons:
+                try:
+                    eid = btn.id
+                except Exception:
+                    eid = None
+                if eid not in seen_ids:
+                    seen_ids.add(eid)
+                    unique_buttons.append(btn)
+
+            if unique_buttons:
+                logger.info(f"Found {len(unique_buttons)} available connect buttons")
+                return unique_buttons
+
+            if last_count == 0:
+                logger.debug("Results are present but connect buttons have not appeared yet; retrying.")
+            last_count = len(unique_buttons)
+            time.sleep(0.5)
+
+        logger.info("Found 0 available connect buttons")
+        return []
+
+    def _deprecated_click_connect_and_validate(self, driver, button):
+        """Deprecated: superseded by reliability-first handler below."""
+        import time
+
         self.human_delay(0.5, 1.5)
-        driver.execute_script("arguments[0].scrollIntoView(true);", button)
-        driver.execute_script("arguments[0].click();", button)
-        self.human_delay(1, 2)
-        return self.handle_connect_modal(driver)
+        if self._find_active_connect_dialog(driver, timeout=1):
+            if not self.dismiss_active_modal(driver, timeout=2):
+                logger.warning("⚠️ A previous modal is still blocking the page; skipping this result.")
+                return False
+        
+        # 1. Scroll and hide overlays (like the chat window)
+        driver.execute_script("""
+            arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});
+            let chat = document.querySelector('.msg-overlay-container');
+            if (chat) chat.style.display = 'none';
+        """, button)
+        time.sleep(1)
 
-    def handle_connect_modal(self, driver):
-        """Handle connection modal with updated 2025 selectors"""
+        # 2. Click the Connect button natively or via JS fallback
+        try:
+            button.click()
+            logger.info("✅ Clicked initial Connect button natively.")
+        except Exception:
+            driver.execute_script("arguments[0].click();", button)
+            logger.info("✅ Clicked initial Connect button via JS.")
+
+        # 3. Wait for the actual invite UI instead of searching the whole page immediately
+        dialog = self._find_active_connect_dialog(driver, timeout=8)
+        if not dialog:
+            if self.click_send_without_note_button(driver, timeout=2):
+                return True
+            logger.warning("⚠️ Connect modal did not appear after clicking the result.")
+            return False
+
+        # 4. Handle only the active modal
+        return self.handle_connect_modal(driver, dialog=dialog)
+
+    def _deprecated_handle_connect_modal(self, driver, dialog=None):
+        """Deprecated: superseded by reliability-first handler below."""
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
         from selenium.common.exceptions import TimeoutException
+        self.human_delay(1, 2)
+
+        dialog = dialog or self._find_active_connect_dialog(driver, timeout=6)
+        if not dialog:
+            logger.warning("⚠️ No active connect modal found.")
+            return False
+
+        # 1. Attempt to click Send Without Note
+        clicked = self.click_send_without_note_button(driver, timeout=8, dialog=dialog)
+
+        if not clicked:
+            if self.dismiss_active_modal(driver, timeout=2):
+                logger.info("🧹 Dismissed stuck modal.")
+            return False
+            # If we couldn't click send, dismiss the modal so we can move to the next person cleanly
+            try:
+                close_btn = driver.find_element(By.CSS_SELECTOR, "button[aria-label='Dismiss']")
+                driver.execute_script("arguments[0].click();", close_btn)
+                logger.info("🧹 Dismissed stuck modal.")
+            except:
+                pass
+            return False
         
         self.human_delay(1, 2)
         
-        # Try to find and click "Send without a note" or "Send now" button
-        send_selectors = [
-            # Updated 2025 selectors
-            "button[aria-label='Send without a note']",
-            "button[aria-label='Send now']",
-            "button[aria-label='Send invitation']",
-        ]
-        
-        for selector in send_selectors:
-            try:
-                btn = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                )
-                btn.click()
-                logger.info(f"Clicked send button with selector: {selector}")
-                break
-            except TimeoutException:
-                continue
-        else:
-            # Fallback: Find by button text
-            try:
-                all_buttons = driver.find_elements(By.TAG_NAME, "button")
-                for btn in all_buttons:
-                    btn_text = btn.text.strip()
-                    if btn_text in ["Send without a note", "Send now", "Send"]:
-                        if btn.is_displayed() and btn.is_enabled():
-                            btn.click()
-                            logger.info(f"Clicked send button with text: {btn_text}")
-                            break
-            except Exception as e:
-                logger.warning(f"Fallback button click failed: {e}")
-        
-        self.human_delay(1, 2)
-        
-        # Check for success - look for "Pending" state
+        # 2. Check for success - Look ONLY for "Pending" state
         try:
-            WebDriverWait(driver, 5).until(
+            WebDriverWait(driver, 4).until(
                 EC.any_of(
                     EC.presence_of_element_located((By.XPATH, "//button[contains(text(), 'Pending')]")),
                     EC.presence_of_element_located((By.XPATH, "//span[contains(text(), 'Pending')]")),
-                    # Modal closed successfully indicator
-                    EC.invisibility_of_element_located((By.CSS_SELECTOR, ".artdeco-modal"))
+                    EC.invisibility_of_element(dialog)
                 )
             )
             return True
         except TimeoutException:
-            # Try to close modal if still open
+            return self._find_active_connect_dialog(driver, timeout=1) is None
+            # If it doesn't say Pending but the modal closed on its own, assume success
             try:
-                close_btn = driver.find_element(By.CSS_SELECTOR, "button[aria-label='Dismiss']")
-                close_btn.click()
+                driver.find_element(By.CSS_SELECTOR, ".artdeco-modal")
+                return False # Modal still here = failed
             except:
+                return True
+
+    def click_connect_and_validate(self, driver, button):
+        """Click Connect and handle all LinkedIn outcomes reliably."""
+        import time
+        from selenium.webdriver.common.action_chains import ActionChains
+
+        self.human_delay(0.5, 1.5)
+        # Clean previous modal if any
+        if self._find_active_connect_dialog(driver, timeout=1):
+            if not self.dismiss_active_modal(driver, timeout=2):
+                logger.warning("⚠️ Modal blocking page, skipping.")
+                return False
+
+        # Scroll + hide chat overlay + clear any blocking elements including interop-outlet
+        driver.execute_script("""
+            arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});
+            let chat = document.querySelector('.msg-overlay-container');
+            if (chat) chat.style.display = 'none';
+            // Hide premium upsell overlays and the interop-outlet that intercepts clicks
+            document.querySelectorAll(
+                '.artdeco-toasts, .premium-upsell-link, #interop-outlet, #interop-outlet-main, [id*="interop-outlet"]'
+            ).forEach(el => el.style.display = 'none');
+        """, button)
+
+        # Extract href for <A> tag fallback (LinkedIn now uses <A> connect buttons)
+        connect_href = None
+        try:
+            connect_href = driver.execute_script("""
+                const b = arguments[0];
+                if (b.tagName === 'A' && b.href && b.href.includes('search-custom-invite')) {
+                    return b.href;
+                }
+                const parentA = b.closest('a[href*="search-custom-invite"]');
+                if (parentA) return parentA.href;
+                return null;
+            """, button)
+            if connect_href:
+                logger.info(f"📎 Extracted custom invite href: {connect_href}")
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+        # Log what we're about to click for diagnostics
+        try:
+            btn_info = driver.execute_script("""
+                const b = arguments[0];
+                const rect = b.getBoundingClientRect();
+                const cx = rect.left + rect.width / 2;
+                const cy = rect.top + rect.height / 2;
+                const elAtPoint = document.elementFromPoint(cx, cy);
+                let interceptor = null;
+                if (elAtPoint && !b.contains(elAtPoint)) {
+                    interceptor = elAtPoint.tagName + (elAtPoint.className ? '.' + elAtPoint.className : '') + (elAtPoint.id ? '#' + elAtPoint.id : '');
+                }
+                
+                return {
+                    tag: b.tagName,
+                    aria: b.getAttribute('aria-label'),
+                    text: (b.innerText || '').trim().substring(0, 50),
+                    visible: b.offsetParent !== null,
+                    disabled: b.disabled,
+                    rect: {top: rect.top, left: rect.left, w: rect.width, h: rect.height},
+                    interceptor: interceptor,
+                    href: b.href ? b.href : null
+                };
+            """, button)
+            logger.info(f"🔍 Button info before click: {btn_info}")
+        except Exception:
+            pass
+
+        # Click connect using the real actionable element first.
+        from selenium.webdriver.common.by import By
+        click_targets = []
+        try:
+            actionable_target = button
+            if (button.tag_name or "").lower() not in {"a", "button"}:
+                actionable_target = button.find_element(By.XPATH, "./ancestor-or-self::a[1] | ./ancestor-or-self::button[1]")
+            click_targets.append(("primary", actionable_target))
+        except Exception:
+            click_targets.append(("primary", button))
+
+        try:
+            span_target = button.find_element(By.CSS_SELECTOR, "span.artdeco-button__text")
+            click_targets.append(("label_span", span_target))
+        except Exception:
+            pass
+
+        try:
+            generic_span_target = button.find_element(By.CSS_SELECTOR, "span")
+            if all(target.id != generic_span_target.id for _, target in click_targets):
+                click_targets.append(("fallback_span", generic_span_target))
+        except Exception:
+            pass
+
+        clicked_via_target = None
+        for target_name, click_target in click_targets:
+            try:
+                ActionChains(driver).move_to_element(click_target).pause(0.3).click(click_target).perform()
+                logger.info(f"✅ Fired Connect button click via ActionChains on {target_name}.")
+                clicked_via_target = click_target
+                time.sleep(0.8)
+                if self._has_active_invite_modal(driver) or self._button_or_card_indicates_sent(driver, button):
+                    break
+            except Exception as e:
+                logger.debug(f"ActionChains click failed on {target_name}: {e}")
+
+            try:
+                click_target.click()
+                logger.info(f"✅ Fired native Selenium click on {target_name}.")
+                clicked_via_target = click_target
+                time.sleep(0.8)
+                if self._has_active_invite_modal(driver) or self._button_or_card_indicates_sent(driver, button):
+                    break
+            except Exception as e:
+                logger.debug(f"Native click failed on {target_name}: {e}")
+
+        # ALWAYS fire the deep JS event dispatch as a secondary guarantee!
+        # If the primary element did not trigger a state change, also hit inner descendants.
+        if not (self._has_active_invite_modal(driver) or self._button_or_card_indicates_sent(driver, button)):
+            try:
+                driver.execute_script("""
+                    const btn = arguments[0];
+                    const targets = [
+                        btn,
+                        btn.querySelector('span.artdeco-button__text'),
+                        btn.querySelector('span')
+                    ].filter(Boolean);
+                    
+                    targets.forEach(t => {
+                        try {
+                            t.focus();
+                            t.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, cancelable: true}));
+                            t.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
+                            t.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true}));
+                            t.dispatchEvent(new PointerEvent('pointerup', {bubbles: true, cancelable: true}));
+                            t.click();
+                        } catch(e) {}
+                    });
+                """, button)
+                logger.info("✅ Fired deep JS event dispatch across clickable element and inner labels.")
+            except Exception as e:
+                logger.warning(f"⚠️ JS click fallback failed (often means click succeeded and button went stale): {e}")
+
+        time.sleep(1.2)
+    
+        # Detect outcome
+        result = self._detect_connect_outcome(driver, button, timeout=9)
+    
+        if result in ['MODAL', 'OTHER_MODAL']:
+            return self.handle_connect_modal(driver)
+        elif result == 'SENT':
+            logger.info("🎉 Invitation sent (instant or button state change).")
+            return True
+
+        if self._has_active_invite_modal(driver) or self._find_active_connect_dialog(driver, timeout=1.5):
+            logger.info("✅ Invite modal detected by fallback probe.")
+            return self.handle_connect_modal(driver)
+
+        # ── HREF FALLBACK: Navigate directly to the custom invite page ──
+        if connect_href:
+            logger.info("🔗 Click did not trigger modal — navigating directly to invite href as fallback.")
+            return self._handle_custom_invite_page(driver, connect_href)
+
+        self._log_invite_modal_diagnostics(
+            driver,
+            context="connect_outcome_none",
+            selectors=[
+                (By.CSS_SELECTOR, "#artdeco-modal-outlet [data-test-modal-id='send-invite-modal']"),
+                (By.CSS_SELECTOR, "#artdeco-modal-outlet .artdeco-modal-overlay"),
+                (By.CSS_SELECTOR, "button[aria-label='Send without a note']"),
+            ]
+        )
+        logger.warning("❌ No modal or success state detected.")
+        return False
+    def _handle_custom_invite_page(self, driver, invite_href):
+        """Fallback: navigate directly to the custom invite href to trigger the modal.
+
+        LinkedIn's new <A> connect buttons have href like:
+            /preload/search-custom-invite/?vanityName=...
+        Navigating there loads the invite modal inside the search page.
+        """
+        import time
+
+        search_url = driver.current_url
+        logger.info(f"🔗 Navigating to custom invite page: {invite_href}")
+
+        try:
+            # Navigate to the invite href — LinkedIn will load the modal
+            driver.get(invite_href)
+            time.sleep(2.5)
+
+            # Wait for the send-invite modal to appear (up to 8 seconds)
+            deadline = time.time() + 8
+            modal_found = False
+
+            while time.time() < deadline:
+                modal_found = self._has_active_invite_modal(driver)
+                if modal_found:
+                    break
+
+                # Also check for the artdeco modal with send button directly
+                has_modal = driver.execute_script("""
+                    const outlet = document.querySelector('#artdeco-modal-outlet');
+                    if (!outlet) return false;
+                    const overlay = outlet.querySelector(
+                        '[data-test-modal-id="send-invite-modal"][aria-hidden="false"], ' +
+                        '.artdeco-modal-overlay:not([aria-hidden="true"])'
+                    );
+                    if (!overlay) return false;
+                    const sendBtn = overlay.querySelector(
+                        "button[aria-label='Send without a note'], " +
+                        "button[aria-label*='Send without a note'], " +
+                        "button.artdeco-button--primary"
+                    );
+                    return Boolean(sendBtn);
+                """)
+                if has_modal:
+                    modal_found = True
+                    break
+
+                time.sleep(0.4)
+
+            if modal_found:
+                logger.info("✅ Invite modal appeared after href navigation.")
+                success = self.handle_connect_modal(driver)
+
+                # Navigate back to search results
+                if driver.current_url != search_url:
+                    logger.info("↩️ Navigating back to search results.")
+                    driver.get(search_url)
+                    time.sleep(2)
+
+                return success
+            else:
+                # Check if the invitation was sent instantly (no modal)
+                sent = driver.execute_script("""
+                    const el = Array.from(document.querySelectorAll('span, div, button')).find(n => {
+                        const t = (n.innerText || '').trim().toLowerCase();
+                        return t === 'pending' || t.includes('invitation sent');
+                    });
+                    return Boolean(el);
+                """)
+                if sent:
+                    logger.info("🎉 Invitation sent instantly via href navigation (no modal needed).")
+                    if driver.current_url != search_url:
+                        driver.get(search_url)
+                        time.sleep(2)
+                    return True
+
+                logger.warning("❌ Modal did not appear even after href navigation.")
+                # Navigate back to search results regardless
+                if driver.current_url != search_url:
+                    driver.get(search_url)
+                    time.sleep(2)
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ Error handling custom invite page: {e}", exc_info=True)
+            # Always try to get back to search results
+            try:
+                if driver.current_url != search_url:
+                    driver.get(search_url)
+                    time.sleep(2)
+            except Exception:
                 pass
             return False
 
-    def go_to_next_page(self, driver):
-        """Navigate to next page of search results"""
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-        from selenium.common.exceptions import TimeoutException
+    def _detect_connect_outcome(self, driver, button, timeout=6):
+        """Detect what happened after clicking Connect (modal or instant send)."""
+        import time
+     
+        deadline = time.time() + timeout
+        modal_grace_deadline = time.time() + min(3.5, max(2.0, timeout * 0.45))
+     
+        while time.time() < deadline:
+            try:
+                if self._has_active_invite_modal(driver):
+                    return 'MODAL'
+
+                # 1. First, check purely for modals regardless of the button state
+                result = driver.execute_script("""
+                    const pendingBtn = Array.from(document.querySelectorAll('button')).find(b => {
+                        const text = (b.innerText || '').trim();
+                        return text === 'Pending';
+                    });
+                    if (pendingBtn) return 'SENT';
+
+                    const pendingSpan = Array.from(document.querySelectorAll('span, div')).find(node => {
+                        const text = (node.innerText || '').trim();
+                        return text === 'Pending' || text.includes('Invitation sent');
+                    });
+                    if (pendingSpan) return 'SENT';
+
+                    const outletDialog = document.querySelector(
+                        "#artdeco-modal-outlet .artdeco-modal.send-invite, " +
+                        "#artdeco-modal-outlet .artdeco-modal[role='dialog'], " +
+                        "#artdeco-modal-outlet [data-test-modal][role='dialog'], " +
+                        "#artdeco-modal-outlet [role='dialog']"
+                    );
+                    if (outletDialog) return 'OTHER_MODAL';
+
+                    const anyModal = document.querySelector('.artdeco-modal[role="dialog"]');
+                    if (anyModal) return 'OTHER_MODAL';
+                    
+                    return null;
+                """)
+                if result in {'MODAL', 'OTHER_MODAL'}:
+                    return result
+
+                if time.time() >= modal_grace_deadline:
+                    if self._button_or_card_indicates_sent(driver, button):
+                        return 'SENT'
+
+                    toast_sent = driver.execute_script("""
+                        const successNode = Array.from(document.querySelectorAll('div[role="alert"], div[aria-live], span, div')).find((node) => {
+                            const text = (node.innerText || '').trim().toLowerCase();
+                            return text.includes('invitation sent');
+                        });
+                        return Boolean(successNode);
+                    """)
+                    if toast_sent:
+                        return 'SENT'
+                    
+            except Exception as e:
+                logger.error(f"❌ Exception in outcome detection: {e}")
+                
+            time.sleep(0.4)
+     
+        return "NONE"
+     
+     
+     
+     
+    def handle_connect_modal(self, driver, dialog=None):
+        """Handle modal and click Send (robust + flexible text match)."""
+        import time
+    
+        self.human_delay(1, 2)
+        logger.info("⏳ Handling connect modal...")
+    
+        deadline = time.time() + 10
+        clicked = False
+        last_result = None
+    
+        while time.time() < deadline:
+            result = driver.execute_script("""
+                try {
+                    let overlay = document.querySelector('#artdeco-modal-outlet [data-test-modal-id="send-invite-modal"][aria-hidden="false"]');
+                    if (!overlay) {
+                        overlay = document.querySelector('#artdeco-modal-outlet [data-test-modal-container][data-test-modal-id="send-invite-modal"]');
+                    }
+                    
+                    // Fallback to any active modal overlay if exact ID is missing
+                    if (!overlay || overlay.getAttribute('aria-hidden') === 'true') {
+                        overlay = document.querySelector('#artdeco-modal-outlet .artdeco-modal-overlay:not([aria-hidden="true"])');
+                        if (!overlay) {
+                            return 'NO_ACTIVE_MODAL';
+                        }
+                    }
+    
+                    let actionbar = overlay.querySelector('.artdeco-modal__actionbar');
+                    let dialog = overlay.querySelector('.artdeco-modal.send-invite, .artdeco-modal[role="dialog"], [data-test-modal][role="dialog"], [role="dialog"]');
+                    if (!actionbar) {
+                        // Sometimes the dialog itself is separated from the overlay element in the DOM tree depending on the parent
+                        dialog = document.querySelector('#artdeco-modal-outlet .artdeco-modal.send-invite, #artdeco-modal-outlet .artdeco-modal[role="dialog"], #artdeco-modal-outlet [role="dialog"], .artdeco-modal[role="dialog"]');
+                        if (dialog) {
+                            actionbar = dialog.querySelector('.artdeco-modal__actionbar');
+                        }
+                    }
+                    
+                    if (!actionbar) return 'NO_ACTIONBAR';
+    
+                    let btn = null;
+                    const selectorTargets = [
+                        "button[aria-label='Send without a note']",
+                        "button[aria-label*='Send without a note']",
+                        "button.artdeco-button--primary",
+                        "button[aria-label*='Send']"
+                    ];
+                    for (const selector of selectorTargets) {
+                        btn = actionbar.querySelector(selector)
+                            || overlay.querySelector(selector)
+                            || (dialog && dialog.querySelector(selector));
+                        if (btn) break;
+                    }
+
+                    if (!btn) {
+                        btn = Array.from(actionbar.querySelectorAll('button')).find(b => {
+                            const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                            const text = (b.innerText || '').toLowerCase();
         
-        try:
-            wait = WebDriverWait(driver, 5)
-            next_button = wait.until(EC.element_to_be_clickable((
-                By.XPATH,
-                "//button[@aria-label='Next' and not(@disabled)] | //a[@aria-label='Next']"
-            )))
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_button)
-            next_button.click()
-            return True
-        except TimeoutException:
-            return False
-        except Exception as e:
-            return False
+                            return aria.includes('send') || text.includes('send');
+                        });
+                    }
+
+                    if (!btn) return 'NO_BUTTON';
+
+                    if (btn.disabled) return 'BUTTON_DISABLED';
+
+                    const rect = btn.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) return 'NOT_VISIBLE';
+
+                    const elAtPoint = document.elementFromPoint(
+                        rect.left + rect.width / 2,
+                        rect.top + rect.height / 2
+                    );
+
+                    if (elAtPoint && !btn.contains(elAtPoint) && !actionbar.contains(elAtPoint)) {
+                        return 'CLICK_INTERCEPTED';
+                    }
+
+                    btn.scrollIntoView({block: 'center'});
+                    btn.focus();
+
+                    btn.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}));
+                    btn.dispatchEvent(new PointerEvent('pointerup', {bubbles: true}));
+                    btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+                    btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+                    btn.click();
+
+                    return 'CLICKED_SUCCESS';
+
+                } catch (e) {
+                    return 'ERROR: ' + e.toString();
+                }
+            """)
+    
+            last_result = result
+    
+            if result == 'CLICKED_SUCCESS':
+                clicked = True
+                logger.info("✅ Clicked Send button.")
+                break
+    
+            elif result == 'BUTTON_DISABLED':
+                time.sleep(0.3)
+    
+            elif result in ['NO_ACTIVE_MODAL', 'NO_ACTIONBAR']:
+                time.sleep(0.3)
+    
+            elif result == 'CLICK_INTERCEPTED':
+                logger.debug("Click intercepted, retrying...")
+                time.sleep(0.4)
+    
+            else:
+                time.sleep(0.4)
+    
+        if not clicked:
+            logger.error(f"❌ Failed to click send button. Last result: {last_result}")
+    
+            # Fallback
+            try:
+                fallback = driver.find_element("xpath", "//button[contains(., 'Send')]")
+                fallback.click()
+                logger.info("✅ Fallback Selenium click worked.")
+                clicked = True
+            except Exception as e:
+                logger.error(f"❌ Fallback failed: {e}")
+                self.dismiss_active_modal(driver, timeout=2)
+                return False
+    
+        # Verify submission
+        success = self._wait_for_invite_submit_result(driver, timeout=5)
+    
+        if success:
+            logger.info("🎉 Invitation sent successfully!")
+        else:
+            logger.warning("⚠️ Clicked but verification uncertain.")
+    
+        self.human_delay(0.8, 1.6)
+        return True
 
     
     def process_inbox_replies_enhanced(self, driver, max_replies=10):
@@ -2455,9 +4644,8 @@ Return ONLY the message text, no labels or formatting.
     def generate_contextual_ai_response(self, conversation_history: List[Dict[str, str]], 
                                    conversation_details: Dict[str, Any]) -> str:
         """Generate a highly contextual AI response based on conversation history and details"""
-        if not self.model:
-            return "I appreciate your message. I'll get back to you soon."
-        
+        fallback_msg = "Thank you for your message. I'll review this and respond properly soon."
+
         # Format conversation history for the prompt
         formatted_history = "\n".join([
             f"{msg['sender']}: {msg['message']}" for msg in conversation_history[-10:]  # Last 10 messages
@@ -2486,23 +4674,47 @@ Return ONLY the message text, no labels or formatting.
 
     Craft your response:"""
         
-        try:
-            response = self.model.generate_content(prompt)
-            ai_message = response.text.strip()
-            
-            # Clean up the response
-            ai_message = re.sub(r'^(Response:|AI:|Assistant:)\s*', '', ai_message, flags=re.IGNORECASE)
-            ai_message = ai_message.strip('"\'')
-            
-            # Ensure it's not too long
-            if len(ai_message) > 300:
-                ai_message = ai_message[:297] + "..."
+        dashboard_url = self.config.get('dashboard_url', 'http://127.0.0.1:5000')
+        endpoint = f"{dashboard_url.rstrip('/')}/api/client/ai/generate"
+
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    endpoint, 
+                    json={'prompt': prompt},
+                    headers=self._get_auth_headers(),
+                    timeout=30
+                )
                 
-            return ai_message
-            
-        except Exception as e:
-            logger.error(f"AI response generation failed: {e}")
-            return "Thank you for your message. I'll review this and respond properly soon."
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('success'):
+                        ai_message = data.get('message', '').strip()
+                        
+                        # Clean up the response
+                        ai_message = re.sub(r'^(Response:|AI:|Assistant:)\s*', '', ai_message, flags=re.IGNORECASE)
+                        ai_message = ai_message.strip('"\'')
+                        
+                        # Ensure it's not too long
+                        if len(ai_message) > 300:
+                            ai_message = ai_message[:297] + "..."
+                            
+                        return ai_message
+                    else:
+                        logger.error(f"❌ Backend AI Generation error: {data.get('error')}")
+                        break
+                elif response.status_code == 429:
+                    logger.warning("⏳ Daily AI quota exceeded or rate limit hit. Using fallback message.")
+                    return fallback_msg
+                else:
+                    logger.error(f"❌ AI proxy returned {response.status_code}: {response.text}")
+                    break
+                    
+            except Exception as e:
+                logger.error(f"AI response generation failed: {e}")
+                time.sleep(2)
+                
+        return fallback_msg
 
 
     # ==============================================
@@ -2511,13 +4723,14 @@ Return ONLY the message text, no labels or formatting.
 
     # Replace your run_enhanced_outreach_campaign method with this corrected version
 
-    def run_enhanced_outreach_campaign(self, driver, campaign_id, user_config, campaign_data):
+    def run_enhanced_outreach_campaign(self, driver, task_id, campaign_id, user_config, campaign_data):
         """
         Run outreach campaign with AI generation, user preview, and confirmation.
         """
         try:
             # Initialize campaign status
             self.active_campaigns[campaign_id] = {
+                'task_id': task_id,
                 'status': 'running',
                 'progress': 0,
                 'total': len(campaign_data.get('contacts', [])[:campaign_data.get('max_contacts', 0)]),
@@ -2594,7 +4807,7 @@ Return ONLY the message text, no labels or formatting.
                     }
                     
                     # 2. Report to dashboard immediately
-                    self.report_progress_to_dashboard(campaign_id)
+                    self.report_progress_to_dashboard(campaign_id, task_id=task_id)
                     
                     # 3. Wait for user decision with timeout
                     logger.info(f"⏳ Waiting for user decision for {contact['Name']}... (Timeout: 5 minutes)")
@@ -2655,7 +4868,7 @@ Return ONLY the message text, no labels or formatting.
 
                     # Update progress
                     self.active_campaigns[campaign_id]['progress'] += 1
-                    self.report_progress_to_dashboard(campaign_id)
+                    self.report_progress_to_dashboard(campaign_id, task_id=task_id)
 
                 except Exception as e:
                     logger.error(f"❌ Error processing {contact.get('Name', 'Unknown')}: {e}", exc_info=True)
@@ -2665,13 +4878,13 @@ Return ONLY the message text, no labels or formatting.
             # Final campaign status update
             self.active_campaigns[campaign_id]['status'] = 'completed' if not self.active_campaigns[campaign_id].get('stop_requested') else 'stopped'
             self.active_campaigns[campaign_id]['end_time'] = datetime.now().isoformat()
-            self.report_progress_to_dashboard(campaign_id, final=True)
+            self.report_progress_to_dashboard(campaign_id, final=True, task_id=task_id)
 
         except Exception as e:
             logger.error(f"❌ Campaign {campaign_id} failed critically: {e}", exc_info=True)
             self.active_campaigns[campaign_id]['status'] = 'failed'
             self.active_campaigns[campaign_id]['error'] = str(e)
-            self.report_progress_to_dashboard(campaign_id, final=True)
+            self.report_progress_to_dashboard(campaign_id, final=True, task_id=task_id)
 
     def run_enhanced_keyword_search(self, driver, search_id, search_params):
         """
@@ -2681,11 +4894,20 @@ Return ONLY the message text, no labels or formatting.
         try:
             keywords = search_params.get('keywords', '')
             max_invites = search_params.get('max_invites', 10)
+            search_filters = self.normalize_keyword_search_filters(search_params.get('filters', {}))
 
             logger.info(f"🔍 Starting keyword search for: '{keywords}' with driver {driver.session_id}")
+            if search_filters:
+                logger.info(f"🧭 Requested keyword search filters: {search_filters}")
 
             # --- FIX: Pass the search_id to search_and_connect ---
-            sent_count = self.search_and_connect(driver, keywords, max_invites=max_invites, search_id=search_id)
+            sent_count = self.search_and_connect(
+                driver,
+                keywords,
+                max_invites=max_invites,
+                search_id=search_id,
+                search_filters=search_filters
+            )
 
             logger.info(f"✅ Keyword search completed. Invitations sent: {sent_count}/{max_invites}")
             
@@ -2696,6 +4918,7 @@ Return ONLY the message text, no labels or formatting.
                  payload = {
                     'keywords': keywords,
                     'max_invites': max_invites,
+                    'filters': search_filters,
                     'invites_sent': sent_count,
                     'status': 'stopped',
                     'timestamp': datetime.now().isoformat()
@@ -2709,6 +4932,7 @@ Return ONLY the message text, no labels or formatting.
                 payload = {
                     'keywords': keywords,
                     'max_invites': max_invites,
+                    'filters': search_filters,
                     'invites_sent': sent_count,
                     'status': 'completed',
                     'timestamp': datetime.now().isoformat()
@@ -2741,11 +4965,13 @@ Return ONLY the message text, no labels or formatting.
         try:
             kw = params.get("keywords", "")
             max_invites = int(params.get("max_invites", 15))
+            search_filters = self.normalize_keyword_search_filters(params.get("filters", {}))
             
             self.active_searches[task_id].update({
                 "status": "initializing",
                 "keywords": kw,
                 "max_invites": max_invites,
+                "filters": search_filters,
                 "start_time": datetime.now().isoformat(),
                 "invites_sent": 0,
                 "progress": 0
@@ -2756,9 +4982,9 @@ Return ONLY the message text, no labels or formatting.
 
             # Initialize LinkedIn automation instance (same as campaign flow)
             automation = LinkedInAutomation(
-                email=user_cfg.get('linkedin_email', self.config['linkedin_email']),
-                password=user_cfg.get('linkedin_password', self.config['linkedin_password']),
-                api_key=user_cfg.get('gemini_api_key', self.config['gemini_api_key'])
+                email=user_cfg.get('linkedin_email', self.email),
+                password=user_cfg.get('linkedin_password', self.password),
+                api_key=user_cfg.get('gemini_api_key', self.config.get('gemini_api_key'))
             )
 
             # Login to LinkedIn
@@ -2781,9 +5007,16 @@ Return ONLY the message text, no labels or formatting.
 
             # Perform search and connect
             logger.info(f"🔍 Starting search and connect for: '{kw}'")
-            
-            # FIXED: Use the correct method - search_profiles instead of search_and_connect
-            sent_count = automation.search_profiles(kw, max_invites=max_invites)
+            if search_filters:
+                logger.info(f"🧭 Requested search-connect filters: {search_filters}")
+
+            sent_count = self.search_and_connect(
+                automation.driver,
+                kw,
+                max_invites=max_invites,
+                search_id=task_id,
+                search_filters=search_filters
+            )
 
             # Update final status
             self.active_searches[task_id]["invites_sent"] = sent_count
@@ -2797,6 +5030,7 @@ Return ONLY the message text, no labels or formatting.
             self.report_search_results_to_dashboard(task_id, {
                 "keywords": kw,
                 "max_invites": max_invites,
+                "filters": search_filters,
                 "invites_sent": sent_count,
                 "timestamp": datetime.now().isoformat(),
                 "success": True,
@@ -2815,6 +5049,7 @@ Return ONLY the message text, no labels or formatting.
             self.report_search_results_to_dashboard(task_id, {
                 "error": str(exc),
                 "keywords": kw,
+                "filters": search_filters,
                 "timestamp": datetime.now().isoformat(),
                 "success": False
             })
@@ -2832,9 +5067,9 @@ Return ONLY the message text, no labels or formatting.
         try:
             # Initialize LinkedIn automation
             automation = LinkedInAutomation(
-                email=user_config.get('linkedin_email', self.config['linkedin_email']),
-                password=user_config.get('linkedin_password', self.config['linkedin_password']),
-                api_key=user_config.get('gemini_api_key', self.config['gemini_api_key'])
+                email=user_config.get('linkedin_email', self.email),
+                password=user_config.get('linkedin_password', self.password),
+                api_key=user_config.get('gemini_api_key', self.config.get('gemini_api_key'))
             )
 
             # Login to LinkedIn
@@ -3168,7 +5403,7 @@ Return ONLY the message text, no labels or formatting.
         return False
     
 
-    def report_progress_to_dashboard(self, campaign_id, final=False):
+    def report_progress_to_dashboard(self, campaign_id, final=False, task_id=None, task_type="outreach_campaign"):
         """Report campaign progress back to dashboard with better error handling"""
         try:
             dashboard_url = self.config.get('dashboard_url')
@@ -3177,6 +5412,7 @@ Return ONLY the message text, no labels or formatting.
                 return
 
             progress_data = self.active_campaigns.get(campaign_id, {})
+            task_id = task_id or progress_data.get('task_id')
             
             # Include current contact info if awaiting confirmation
             if progress_data.get('awaiting_confirmation') and progress_data.get('current_contact_preview'):
@@ -3202,8 +5438,8 @@ Return ONLY the message text, no labels or formatting.
             if final:
                 logger.info(f"💾 Saving final campaign results for {campaign_id} to database...")
                 self.report_task_result({
-                    "task_id": campaign_id,
-                    "type": "outreach_campaign",
+                    "task_id": task_id or campaign_id,
+                    "type": task_type,
                     "success": progress_data.get('status') in ['completed', 'stopped'],
                     "error": progress_data.get('error'),
                     "payload": progress_data,  # Save the entire progress dict as the result
