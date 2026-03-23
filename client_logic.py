@@ -31,8 +31,10 @@ from urllib.parse import urlencode, quote
 import tempfile
 import platform
 import shutil
+import webbrowser
 from typing import List, Dict, Any
 import sys
+import subprocess
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
@@ -127,6 +129,7 @@ LINKEDIN_PROFILE_LANGUAGE_CODE_BY_NAME = {
 
 class EnhancedLinkedInAutomationClient:
     def __init__(self):
+        self.VERSION = "1.0.1"
         self.config_file = "client_config.json"
         self.config = self.load_or_create_config()
         self.runtime_api_key = None
@@ -195,6 +198,57 @@ class EnhancedLinkedInAutomationClient:
         except Exception as e:
             logger.error(f"❌ Error starting polling: {e}")
 
+    def _perform_auto_update(self, download_url):
+        log_msg = f"Starting auto-update from {download_url}..."
+        logger.info(log_msg)
+        if hasattr(self, 'gui_root') and self.gui_root:
+            self.gui_root.after(0, lambda: messagebox.showinfo("Update Required", "A new version of the client is available. The application will now update and restart."))
+        
+        try:
+            current_platform = platform.system().lower()
+            if not getattr(sys, 'frozen', False):
+                logger.warning("Not running as frozen executable, cannot auto-update in-place safely. Opening download URL instead.")
+                if download_url:
+                    webbrowser.open(download_url)
+                sys.exit(0)
+
+            if current_platform != 'windows':
+                logger.info("Non-Windows client detected. Falling back to hosted manual update flow.")
+                if download_url:
+                    webbrowser.open(download_url)
+                sys.exit(0)
+
+            current_exe = sys.executable
+            temp_exe = current_exe + ".new"
+            logger.info(f"Downloading update to {temp_exe}")
+            
+            resp = requests.get(download_url, stream=True, timeout=120)
+            resp.raise_for_status()
+            with open(temp_exe, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            bat_path = os.path.join(os.path.dirname(current_exe), "update.bat")
+            bat_content = f'''@echo off
+timeout /t 3 /nobreak > nul
+del "{current_exe}"
+ren "{temp_exe}" "{os.path.basename(current_exe)}"
+start "" "{current_exe}"
+del "%~f0"
+'''
+            with open(bat_path, "w") as f:
+                f.write(bat_content)
+            
+            subprocess.Popen([bat_path], creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            logger.info("Updater launched. Exiting current process.")
+            sys.exit(0)
+            
+        except Exception as e:
+            logger.error(f"Auto-update failed: {e}")
+            if hasattr(self, 'gui_root') and self.gui_root:
+                self.gui_root.after(0, lambda: messagebox.showerror("Update Failed", f"Failed to auto-update: {e}. Please manually download the latest version."))
+            sys.exit(1)
+
     def load_or_create_config(self):
         """Load existing config or create new one via GUI"""
         if os.path.exists(self.config_file):
@@ -225,7 +279,9 @@ class EnhancedLinkedInAutomationClient:
         payload = {
             "email": dashboard_email,
             "password": dashboard_password,
-            "client_id": client_id
+            "client_id": client_id,
+            "client_version": getattr(self, 'VERSION', '1.0.1'),
+            "platform": platform.system()
         }
 
         try:
@@ -233,6 +289,12 @@ class EnhancedLinkedInAutomationClient:
         except requests.exceptions.RequestException as exc:
             logger.error(f"❌ Dashboard bootstrap request failed: {exc}")
             self.runtime_api_key = None
+            return
+
+        if resp.status_code == 426:
+            data = resp.json() if resp.content else {}
+            logger.error(f"UPDATE REQUIRED: {data.get('message')}")
+            self._perform_auto_update(data.get('download_url'))
             return
 
         if resp.status_code != 200:
@@ -360,7 +422,7 @@ class EnhancedLinkedInAutomationClient:
             'client_id': self.config.get('client_id') or self.config.get('instance_id') or str(uuid.uuid4()),
             'client_info': {
                 'platform': platform.system(),
-                'app_version': self.config.get('version', 'unknown')
+                'app_version': getattr(self, 'VERSION', '1.0.1')
             }
         }
         try:
@@ -370,6 +432,11 @@ class EnhancedLinkedInAutomationClient:
                 tasks = data.get('tasks') or []
                 logger.info(f"📥 Polled {len(tasks)} tasks from server.")
                 return tasks
+            elif resp.status_code == 426:
+                data = resp.json() if resp.content else {}
+                logger.error(f"UPDATE REQUIRED: {data.get('message')}")
+                self._perform_auto_update(data.get('download_url'))
+                return []
             elif resp.status_code == 204:
                 return []
             elif resp.status_code in (401, 403):
@@ -441,12 +508,19 @@ class EnhancedLinkedInAutomationClient:
                 'timestamp': datetime.now().isoformat(),
                 'client_info': {
                     'platform': platform.system(),
-                    'version': '1.0'
+                    'version': getattr(self, 'VERSION', '1.0.1')
                 },
                 'active_inbox_sessions': active_inbox_sessions
             }
             
             resp = requests.post(endpoint, json=payload, headers=self._get_auth_headers(), timeout=15)
+            
+            if resp.status_code == 426:
+                data = resp.json() if resp.content else {}
+                logger.error(f"UPDATE REQUIRED: {data.get('message')}")
+                self._perform_auto_update(data.get('download_url'))
+                return
+
             if resp.status_code in (401, 403):
                 logger.warning(f"Heartbeat rejected with {resp.status_code}. Clearing runtime API key and retrying bootstrap on the next cycle.")
                 self.runtime_api_key = None

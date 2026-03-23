@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['main_client.pyw'],
+    ['main_client.py'],
     pathex=[],
     binaries=[('chromedriver-win64/chromedriver.exe', 'chromedriver-win64')],
     datas=[],
@@ -29,7 +29,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,
+    console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
